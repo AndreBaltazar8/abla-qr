@@ -1,0 +1,33 @@
+// Reads every code in a PNG file.
+//
+//   ablac run examples/read_code.ab -- code.png
+
+import "abla/io"
+import "abla/fs"
+import "abla/float/text"
+import "abla/process/arguments"
+import "../src/qr.ab"
+
+fun main: int {
+    if (processArgumentCount() < 1) {
+        eprintln("usage: read_code FILE.png")
+        return 2
+    }
+    val loaded = qrPngDecode(Path(processArgument(0)).readText())
+    val image = loaded.image
+    if (image == null) {
+        eprintln("cannot read the image: ${loaded.error}")
+        return 1
+    }
+    val codes = qrReadAll(image)
+    println("${codes.size} code(s)")
+    for (code in codes) {
+        val decoded = code.decoded
+        if (decoded != null) {
+            println("version ${decoded.version}-${qrEcName(decoded.errorCorrection)}, ${decoded.correctedErrors} bytes repaired")
+            println("top left corner at ${code.corners[0].x}, ${code.corners[0].y}")
+            println(decoded.data)
+        }
+    }
+    if (codes.size > 0) 0 else 1
+}

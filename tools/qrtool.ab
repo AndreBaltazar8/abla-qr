@@ -1,0 +1,97 @@
+// Command line front end, used by the interoperability tests and handy on its own.
+//
+//   qrtool encode [--ec L|M|Q|H] [--version N] [--mask N] [--eci] [--bytes]
+//                 [--scale N] [--border N] --format matrix|svg|png --out FILE (--text T | --file F)
+//   qrtool decode FILE.png    prints the data, as is, to standard output
+//   qrtool info FILE.png      prints version, level, mask and repaired bytes
+
+import "abla/io"
+import "abla/fs"
+import "abla/process/arguments"
+import "../src/qr.ab"
+
+private fun parseInt(text: string): int {
+    var value = 0
+    for (byte in text) value = value * 10 + byte - 48
+    value
+}
+
+private fun ecOf(name: string): QrErrorCorrection =
+    if (name == "L") qrEcLow else if (name == "Q") qrEcQuartile else if (name == "H") qrEcHigh else qrEcMedium
+
+private fun encodeCommand(): int {
+    var ec = qrEcMedium
+    var version = 0
+    var mask = -1
+    var eci = false
+    var bytes = false
+    var scale = 8
+    var border = 4
+    var format = "png"
+    var out = ""
+    var data = ""
+    var at = 1
+    while (at < processArgumentCount()) {
+        val flag = processArgument(at)
+        if (flag == "--eci") {
+            eci = true
+        } else if (flag == "--bytes") {
+            bytes = true
+        } else {
+            at += 1
+            val value = processArgument(at)
+            if (flag == "--ec") ec = ecOf(value)
+            else if (flag == "--version") version = parseInt(value)
+            else if (flag == "--mask") mask = parseInt(value)
+            else if (flag == "--scale") scale = parseInt(value)
+            else if (flag == "--border") border = parseInt(value)
+            else if (flag == "--format") format = value
+            else if (flag == "--out") out = value
+            else if (flag == "--text") data = value
+            else if (flag == "--file") data = Path(value).readText()
+        }
+        at += 1
+    }
+    val options = QrOptions(
+        errorCorrection = ec,
+        minVersion = if (version > 0) version else 1,
+        maxVersion = if (version > 0) version else 40,
+        mask = mask,
+        utf8Eci = eci
+    )
+    val result = if (bytes) qrEncodeBytes(data, options) else qrEncode(data, options)
+    val matrix = result.matrix
+    if (matrix == null) {
+        eprintln("encode failed: ${result.error}")
+        return 1
+    }
+    val render = QrRenderOptions(scale = scale, border = border)
+    val content = if (format == "svg") qrSvg(matrix, render)
+        else if (format == "matrix") qrMatrixText(matrix)
+        else qrPng(matrix, render)
+    if (!Path(out).writeTextAtomic(content)) return 1
+    0
+}
+
+fun main: int {
+    if (processArgumentCount() < 2) {
+        eprintln("usage: qrtool encode|decode|info ...")
+        return 2
+    }
+    val command = processArgument(0)
+    if (command == "encode") return encodeCommand()
+    val file = Path(processArgument(1)).readTextResult()
+    if (!file.succeeded) {
+        eprintln("cannot read file")
+        return 2
+    }
+    val read = qrReadPng(file.text)
+    val decoded = read.decoded
+    if (decoded == null) {
+        eprintln("no code: ${read.error}")
+        return 1
+    }
+    if (command == "decode") print(decoded.data)
+    else println("version=${decoded.version} ec=${qrEcName(decoded.errorCorrection)} mask=${decoded.mask} corrected=${decoded.correctedErrors} mirrored=${decoded.mirrored}")
+    0
+}

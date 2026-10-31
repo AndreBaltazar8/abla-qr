@@ -1,0 +1,32 @@
+// Creates a code and writes it as SVG, PNG and text art.
+//
+//   ablac run examples/create_code.ab -- "https://example.com" out
+
+import "abla/io"
+import "abla/fs"
+import "abla/process/arguments"
+import "../src/qr.ab"
+
+fun main: int {
+    val data = if (processArgumentCount() > 0) processArgument(0) else "https://example.com"
+    val prefix = if (processArgumentCount() > 1) processArgument(1) else "code"
+
+    val result = qrEncode(data, QrOptions(errorCorrection = qrEcQuartile))
+    val matrix = result.matrix
+    if (matrix == null) {
+        eprintln("cannot encode: ${result.error}")
+        return 1
+    }
+    println("version ${matrix.version}, level ${qrEcName(matrix.errorCorrection)}, mask ${matrix.mask}")
+
+    Path("$prefix.svg").writeTextAtomic(qrSvg(matrix))
+    Path("$prefix.png").writeTextAtomic(qrPng(matrix, QrRenderOptions(scale = 10, darkColor = 0x1B2A4A)))
+
+    // The module matrix is there for any other output.
+    for (y in 0 until matrix.size) {
+        var line = ""
+        for (x in 0 until matrix.size) line += if (matrix.dark(x, y)) "##" else "  "
+        println(line)
+    }
+    0
+}
