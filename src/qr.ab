@@ -2,5 +2,8 @@ import "tables.ab"
 import "reedsolomon.ab"
 import "matrix.ab"
 import "encode.ab"
+import "render.ab"
+import "image.ab"
+import "png.ab"
 
 fun qrPackageVersion(): string = "0.1.0"

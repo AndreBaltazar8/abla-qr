@@ -1,0 +1,404 @@
+// PNG decoding, with the RFC 1951 inflate it needs. Every length in the file is
+// untrusted: decoding fails with an error instead of reading out of bounds.
+
+import "abla/bytes"
+import "image.ab"
+
+fun qrPngSignature(): string {
+    val out = byteBuffer()
+    for (byte in [137, 80, 78, 71, 13, 10, 26, 10]) out.appendByteValue(byte)
+    out.toText()
+}
+
+private fun crcTable(): array<int> {
+    val table = filledArray(256, 0)
+    for (index in 0 until 256) {
+        var value = index
+        for (bit in 0 until 8)
+            value = if ((value & 1) == 1) 0xEDB88320 ^ (value >>> 1) else value >>> 1
+        table[index] = value
+    }
+    table
+}
+
+private val crcValues = crcTable()
+
+fun qrPngCrc32(data: string): int {
+    var crc = 0xFFFFFFFF
+    for (byte in data) crc = crcValues[(crc ^ byte) & 255] ^ (crc >>> 8)
+    crc ^ 0xFFFFFFFF
+}
+
+fun qrPngAdler32(data: string): int {
+    var a = 1
+    var b = 0
+    for (byte in data) {
+        a = (a + byte) % 65521
+        b = (b + a) % 65521
+    }
+    (b << 16) | a
+}
+
+private class BitReader(val data: string, var at: int, val end: int, var bits: int, var count: int, var failed: bool) {
+    fun take(wanted: int): int {
+        while (this.count < wanted) {
+            if (this.at >= this.end) {
+                this.failed = true
+                return 0
+            }
+            this.bits = this.bits | (this.data[this.at] << this.count)
+            this.at += 1
+            this.count += 8
+        }
+        val value = this.bits & ((1 << wanted) - 1)
+        this.bits = this.bits >>> wanted
+        this.count -= wanted
+        value
+    }
+}
+
+// Canonical Huffman code: the count of codes of each length and the symbols in order.
+private class Huffman(val counts: array<int>, val symbols: array<int>)
+
+private fun buildHuffman(lengths: array<int>, begin: int, count: int): Huffman? {
+    val counts = filledArray(16, 0)
+    for (index in 0 until count) {
+        val length = lengths[begin + index]
+        counts[length] += 1
+    }
+    var left = 1
+    counts[0] = 0
+    for (length in 1..15) {
+        left = left * 2 - counts[length]
+        if (left < 0) return null
+    }
+    val offsets = filledArray(16, 0)
+    for (length in 1 until 15) offsets[length + 1] = offsets[length] + counts[length]
+    val symbols = filledArray(count, 0)
+    for (index in 0 until count) {
+        val length = lengths[begin + index]
+        if (length != 0) {
+            symbols[offsets[length]] = index
+            offsets[length] += 1
+        }
+    }
+    Huffman(counts, symbols)
+}
+
+private fun decodeSymbol(var reader: BitReader, table: Huffman): int {
+    var code = 0
+    var first = 0
+    var index = 0
+    for (length in 1..15) {
+        code = code | reader.take(1)
+        if (reader.failed) return -1
+        val count = table.counts[length]
+        if (code - count < first) return table.symbols[index + code - first]
+        index += count
+        first = (first + count) << 1
+        code = code << 1
+    }
+    -1
+}
+
+private val lengthBase: array<int> = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+private val lengthExtra: array<int> = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+private val distanceBase: array<int> = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+private val distanceExtra: array<int> = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+private val codeLengthOrder: array<int> = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+private fun inflateCodes(var reader: BitReader, var out: array<u8>, limit: int, literals: Huffman, distances: Huffman): bool {
+    while (true) {
+        val symbol = decodeSymbol(reader, literals)
+        if (symbol < 0 || symbol > 285) return false
+        if (symbol == 256) return true
+        if (symbol < 256) {
+            if (out.size >= limit) return false
+            out.append(u8(symbol))
+        } else {
+            val length = lengthBase[symbol - 257] + reader.take(lengthExtra[symbol - 257])
+            val distanceSymbol = decodeSymbol(reader, distances)
+            if (distanceSymbol < 0 || distanceSymbol > 29) return false
+            val distance = distanceBase[distanceSymbol] + reader.take(distanceExtra[distanceSymbol])
+            if (reader.failed || distance > out.size || out.size + length > limit) return false
+            for (index in 0 until length) out.append(out[out.size - distance])
+        }
+    }
+    false
+}
+
+private fun fixedTables(): array<Huffman> {
+    val lengths = filledArray(320, 8)
+    for (symbol in 144 until 256) lengths[symbol] = 9
+    for (symbol in 256 until 280) lengths[symbol] = 7
+    val literals = buildHuffman(lengths, 0, 288)
+    for (symbol in 288 until 318) lengths[symbol] = 5
+    val distances = buildHuffman(lengths, 288, 30)
+    if (literals != null && distances != null) [literals, distances] else array<Huffman>()
+}
+
+private val fixedHuffman = fixedTables()
+
+private fun inflateDynamic(var reader: BitReader, var out: array<u8>, limit: int): bool {
+    val literalCount = reader.take(5) + 257
+    val distanceCount = reader.take(5) + 1
+    val codeCount = reader.take(4) + 4
+    if (reader.failed || literalCount > 286 || distanceCount > 30) return false
+    val lengths = filledArray(320, 0)
+    for (index in 0 until codeCount) lengths[codeLengthOrder[index]] = reader.take(3)
+    val codes = buildHuffman(lengths, 0, 19)
+    if (codes == null || reader.failed) return false
+    val symbolLengths = filledArray(320, 0)
+    var index = 0
+    while (index < literalCount + distanceCount) {
+        val symbol = decodeSymbol(reader, codes)
+        if (symbol < 0) return false
+        if (symbol < 16) {
+            symbolLengths[index] = symbol
+            index += 1
+        } else {
+            var previous = 0
+            var repeat = 0
+            if (symbol == 16) {
+                if (index == 0) return false
+                previous = symbolLengths[index - 1]
+                repeat = 3 + reader.take(2)
+            } else if (symbol == 17) {
+                repeat = 3 + reader.take(3)
+            } else {
+                repeat = 11 + reader.take(7)
+            }
+            if (reader.failed || index + repeat > literalCount + distanceCount) return false
+            for (step in 0 until repeat) {
+                symbolLengths[index] = previous
+                index += 1
+            }
+        }
+    }
+    if (symbolLengths[256] == 0) return false
+    val literals = buildHuffman(symbolLengths, 0, literalCount)
+    val distances = buildHuffman(symbolLengths, literalCount, distanceCount)
+    if (literals == null || distances == null) return false
+    inflateCodes(reader, out, limit, literals, distances)
+}
+
+// RFC 1950 zlib stream to bytes, at most `limit` of them. Null when malformed.
+fun qrZlibInflate(data: string, limit: int): array<u8>? {
+    if (data.size < 6) return null
+    val method = data[0]
+    if ((method & 15) != 8 || (method * 256 + data[1]) % 31 != 0 || (data[1] & 32) != 0) return null
+    val reader = BitReader(data, 2, data.size, 0, 0, false)
+    val out = array<u8>()
+    var final = false
+    while (!final) {
+        final = reader.take(1) == 1
+        val kind = reader.take(2)
+        if (reader.failed) return null
+        if (kind == 0) {
+            reader.bits = 0
+            reader.count = 0
+            if (reader.at + 4 > reader.end) return null
+            val length = data[reader.at] | (data[reader.at + 1] << 8)
+            val inverse = data[reader.at + 2] | (data[reader.at + 3] << 8)
+            if ((length ^ 0xFFFF) != inverse) return null
+            reader.at += 4
+            if (reader.at + length > reader.end || out.size + length > limit) return null
+            for (index in 0 until length) out.append(u8(data[reader.at + index]))
+            reader.at += length
+        } else if (kind == 1) {
+            if (!inflateCodes(reader, out, limit, fixedHuffman[0], fixedHuffman[1])) return null
+        } else if (kind == 2) {
+            if (!inflateDynamic(reader, out, limit)) return null
+        } else {
+            return null
+        }
+    }
+    out
+}
+
+private fun u32At(data: string, at: int): int =
+    (data[at] << 24) | (data[at + 1] << 16) | (data[at + 2] << 8) | data[at + 3]
+
+private fun paeth(a: int, b: int, c: int): int {
+    val p = a + b - c
+    val pa = if (p > a) p - a else a - p
+    val pb = if (p > b) p - b else b - p
+    val pc = if (p > c) p - c else c - p
+    if (pa <= pb && pa <= pc) a else if (pb <= pc) b else c
+}
+
+// Undoes filtering for one pass of `rows` rows of `rowBytes` bytes at `begin`.
+private fun unfilter(var raw: array<u8>, begin: int, rows: int, rowBytes: int, unit: int): bool {
+    var row = begin
+    for (y in 0 until rows) {
+        val filter = int(raw[row])
+        if (filter > 4) return false
+        val line = row + 1
+        val above = line - rowBytes - 1
+        for (x in 0 until rowBytes) {
+            val left = if (x >= unit) int(raw[line + x - unit]) else 0
+            val up = if (y > 0) int(raw[above + x]) else 0
+            val corner = if (y > 0 && x >= unit) int(raw[above + x - unit]) else 0
+            val predicted = if (filter == 0) 0
+                else if (filter == 1) left
+                else if (filter == 2) up
+                else if (filter == 3) (left + up) / 2
+                else if (filter == 4) paeth(left, up, corner)
+                else 0
+            raw[line + x] = u8((int(raw[line + x]) + predicted) & 255)
+        }
+        row += rowBytes + 1
+    }
+    true
+}
+
+private fun sampleAt(raw: array<u8>, line: int, index: int, depth: int): int {
+    if (depth == 8) return int(raw[line + index])
+    if (depth == 16) return int(raw[line + index * 2])
+    val bit = index * depth
+    val byte = int(raw[line + bit / 8])
+    (byte >>> (8 - depth - bit % 8)) & ((1 << depth) - 1)
+}
+
+// Decodes any PNG: all colour types and depths, palette and tRNS transparency,
+// Adam7. Transparent pixels are composited over white.
+fun qrPngDecode(png: string, maxPixels: int = qrMaxImagePixels): QrImageResult {
+    val signature = qrPngSignature()
+    if (png.size < 33 || png.slice(0, 8) != signature) return QrImageResult(false, "not_png", null)
+    var at = 8
+    var seenHeader = false
+    var width = 0
+    var height = 0
+    var depth = 0
+    var colorType = 0
+    var interlace = 0
+    var palette = ""
+    var alphaTable = ""
+    val idat = byteBuffer()
+    var ended = false
+    while (!ended) {
+        if (at + 12 > png.size) return QrImageResult(false, "truncated", null)
+        val length = u32At(png, at)
+        if (length > png.size - at - 12) return QrImageResult(false, "truncated", null)
+        val kind = png.slice(at + 4, at + 8)
+        val body = at + 8
+        if (qrPngCrc32(png.slice(at + 4, body + length)) != u32At(png, body + length))
+            return QrImageResult(false, "bad_crc", null)
+        if (kind == "IHDR") {
+            if (length != 13 || seenHeader) return QrImageResult(false, "bad_header", null)
+            seenHeader = true
+            width = u32At(png, body)
+            height = u32At(png, body + 4)
+            depth = png[body + 8]
+            colorType = png[body + 9]
+            interlace = png[body + 12]
+            if (png[body + 10] != 0 || png[body + 11] != 0 || interlace > 1)
+                return QrImageResult(false, "bad_header", null)
+            val depthValid = if (colorType == 0) depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16
+                else if (colorType == 3) depth == 1 || depth == 2 || depth == 4 || depth == 8
+                else if (colorType == 2 || colorType == 4 || colorType == 6) depth == 8 || depth == 16
+                else false
+            if (!depthValid) return QrImageResult(false, "bad_header", null)
+            if (width <= 0 || height <= 0 || width > maxPixels / height)
+                return QrImageResult(false, "too_large", null)
+        } else if (!seenHeader) {
+            return QrImageResult(false, "bad_header", null)
+        } else if (kind == "PLTE") {
+            palette = png.slice(body, body + length)
+        } else if (kind == "tRNS") {
+            alphaTable = png.slice(body, body + length)
+        } else if (kind == "IDAT") {
+            idat.appendText(png.slice(body, body + length))
+        } else if (kind == "IEND") {
+            ended = true
+        }
+        at = body + length + 4
+    }
+    if (idat.size() == 0) return QrImageResult(false, "no_data", null)
+
+    val channels = if (colorType == 2) 3 else if (colorType == 4) 2 else if (colorType == 6) 4 else 1
+    val bits = channels * depth
+    val unit = if (bits < 8) 1 else bits / 8
+
+    val passXStart: array<int> = if (interlace == 1) [0, 4, 0, 2, 0, 1, 0] else [0]
+    val passYStart: array<int> = if (interlace == 1) [0, 0, 4, 0, 2, 0, 1] else [0]
+    val passXStep: array<int> = if (interlace == 1) [8, 8, 4, 4, 2, 2, 1] else [1]
+    val passYStep: array<int> = if (interlace == 1) [8, 8, 8, 4, 4, 2, 2] else [1]
+
+    var expected = 0
+    for (pass in 0 until passXStart.size) {
+        val passWidth = (width + passXStep[pass] - 1 - passXStart[pass]) / passXStep[pass]
+        val passHeight = (height + passYStep[pass] - 1 - passYStart[pass]) / passYStep[pass]
+        if (passWidth > 0 && passHeight > 0) expected += passHeight * ((passWidth * bits + 7) / 8 + 1)
+    }
+    val inflated = qrZlibInflate(idat.toText(), expected)
+    if (inflated == null) return QrImageResult(false, "bad_compression", null)
+    if (inflated.size != expected) return QrImageResult(false, "truncated", null)
+
+    val pixels = filledArray(width * height, u8(255))
+    var cursor = 0
+    for (pass in 0 until passXStart.size) {
+        val passWidth = (width + passXStep[pass] - 1 - passXStart[pass]) / passXStep[pass]
+        val passHeight = (height + passYStep[pass] - 1 - passYStart[pass]) / passYStep[pass]
+        if (passWidth > 0 && passHeight > 0) {
+            val rowBytes = (passWidth * bits + 7) / 8
+            if (!unfilter(inflated, cursor, passHeight, rowBytes, unit))
+                return QrImageResult(false, "bad_filter", null)
+            for (y in 0 until passHeight) {
+                val line = cursor + y * (rowBytes + 1) + 1
+                val target = (passYStart[pass] + y * passYStep[pass]) * width
+                for (x in 0 until passWidth) {
+                    val value = pixelLuma(inflated, line, x, depth, colorType, palette, alphaTable)
+                    if (value < 0) return QrImageResult(false, "bad_palette", null)
+                    pixels[target + passXStart[pass] + x * passXStep[pass]] = u8(value)
+                }
+            }
+            cursor += passHeight * (rowBytes + 1)
+        }
+    }
+    QrImageResult(true, "", QrImage(width, height, pixels))
+}
+
+private fun scaleToByte(value: int, depth: int): int =
+    if (depth >= 8) value else value * 255 / ((1 << depth) - 1)
+
+private fun pixelLuma(raw: array<u8>, line: int, x: int, depth: int, colorType: int, palette: string, alphaTable: string): int {
+    if (colorType == 3) {
+        val index = sampleAt(raw, line, x, depth)
+        if (index * 3 + 2 >= palette.size) return -1
+        val alpha = if (index < alphaTable.size) alphaTable[index] else 255
+        return qrLuma(palette[index * 3], palette[index * 3 + 1], palette[index * 3 + 2], alpha)
+    }
+    if (colorType == 0) {
+        val gray = scaleToByte(sampleAt(raw, line, x, depth), depth)
+        if (alphaTable.size >= 2) {
+            // tRNS names one transparent sample, 16 bits whatever the depth.
+            val key = (alphaTable[0] << 8) | alphaTable[1]
+            val sample = if (depth == 16) (int(raw[line + x * 2]) << 8) | int(raw[line + x * 2 + 1])
+                else sampleAt(raw, line, x, depth)
+            if (sample == key) return 255
+        }
+        return gray
+    }
+    if (colorType == 4) {
+        val gray = sampleAt(raw, line, x * 2, depth)
+        val alpha = sampleAt(raw, line, x * 2 + 1, depth)
+        return qrLuma(gray, gray, gray, alpha)
+    }
+    val red = sampleAt(raw, line, x * (if (colorType == 6) 4 else 3), depth)
+    val green = sampleAt(raw, line, x * (if (colorType == 6) 4 else 3) + 1, depth)
+    val blue = sampleAt(raw, line, x * (if (colorType == 6) 4 else 3) + 2, depth)
+    val alpha = if (colorType == 6) sampleAt(raw, line, x * 4 + 3, depth) else 255
+    if (colorType == 2 && alphaTable.size >= 6) {
+        var same = true
+        for (channel in 0 until 3) {
+            val high = alphaTable[channel * 2]
+            val low = alphaTable[channel * 2 + 1]
+            val sample = if (depth == 16) (int(raw[line + x * 6 + channel * 2]) << 8) | int(raw[line + x * 6 + channel * 2 + 1])
+                else int(raw[line + x * 3 + channel])
+            if (sample != ((high << 8) | low)) same = false
+        }
+        if (same) return 255
+    }
+    qrLuma(red, green, blue, alpha)
+}

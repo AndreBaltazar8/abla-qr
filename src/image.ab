@@ -1,0 +1,35 @@
+// Grayscale images, the reader's input.
+
+class QrImage(val width: int, val height: int, val pixels: array<u8>)
+
+class QrImageResult(val succeeded: bool, val error: string, val image: QrImage?)
+
+val qrMaxImagePixels = 100000000
+
+private fun validSize(width: int, height: int): bool =
+    width > 0 && height > 0 && width <= qrMaxImagePixels / height
+
+private fun failedImage(error: string): QrImageResult = QrImageResult(false, error, null)
+
+// Rec. 601 luma of a colour over white, weighting in 8-bit fixed point.
+fun qrLuma(red: int, green: int, blue: int, alpha: int): int {
+    val luma = (red * 77 + green * 150 + blue * 29) >>> 8
+    if (alpha >= 255) luma else (luma * alpha + 255 * (255 - alpha)) / 255
+}
+
+// `data` holds `channels` bytes per pixel: 1 gray, 2 gray and alpha, 3 RGB, 4 RGBA.
+fun qrImageFromBytes(width: int, height: int, channels: int, data: string): QrImageResult {
+    if (!validSize(width, height)) return failedImage("invalid_size")
+    if (channels < 1 || channels > 4) return failedImage("invalid_channels")
+    if (data.size != width * height * channels) return failedImage("size_mismatch")
+    val pixels = filledArray(width * height, u8(0))
+    for (index in 0 until pixels.size) {
+        val at = index * channels
+        val value = if (channels == 1) data[at]
+            else if (channels == 2) qrLuma(data[at], data[at], data[at], data[at + 1])
+            else if (channels == 3) qrLuma(data[at], data[at + 1], data[at + 2], 255)
+            else qrLuma(data[at], data[at + 1], data[at + 2], data[at + 3])
+        pixels[index] = u8(value)
+    }
+    QrImageResult(true, "", QrImage(width, height, pixels))
+}

@@ -1,0 +1,121 @@
+import "abla/test"
+import "abla/text"
+import "abla/bytes"
+import "abla/fs"
+import "support.ab"
+import "../src/qr.ab"
+
+private fun fromHex(hex: string): string {
+    val out = byteBuffer()
+    var index = 0
+    while (index + 1 < hex.size) {
+        out.appendByteValue(digit(hex[index]) * 16 + digit(hex[index + 1]))
+        index += 2
+    }
+    out.toText()
+}
+
+private fun digit(byte: int): int = if (byte >= 97) byte - 87 else byte - 48
+
+private fun inflatedText(hex: string): string {
+    val result = qrZlibInflate(fromHex(hex), 100000)
+    if (result == null) return "<failed>"
+    val out = byteBuffer()
+    for (byte in result) out.appendByteValue(int(byte))
+    out.toText()
+}
+
+private fun parseInt(text: string): int {
+    var value = 0
+    for (byte in text) value = value * 10 + byte - 48
+    value
+}
+
+private fun errorOf(png: string): string = qrPngDecode(png).error
+
+private fun replaced(text: string, at: int, byte: int): string {
+    val out = byteBuffer()
+    out.appendText(text.slice(0, at))
+    out.appendByteValue(byte)
+    out.appendText(text.slice(at + 1, text.size))
+    out.toText()
+}
+
+fun main: int {
+    expectEqual(qrPngCrc32("123456789"), 0xCBF43926, "CRC-32 check value")
+    expectEqual(qrPngAdler32("Wikipedia"), 0x11E60398, "Adler-32 check value")
+
+    // Vectors from Python's zlib: stored, fixed and dynamic blocks.
+    expectEqual(inflatedText("7801010300fcff616263024d0127"), "abc", "stored block")
+    expectEqual(inflatedText("78014b4c84812438484c4a862000a5a80b11"), "aaaaaaaaaabbbbbbbbbbabcabcabc", "fixed block")
+    expectEqual(inflatedText("78da0bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb29848c2a1e553caa7854f1a8e251c5c34b3100880a8637"), "The quick brown fox jumps over the lazy dog. ".repeat(40), "dynamic block")
+    expect(qrZlibInflate(fromHex("78da0bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb29848c2a1e553caa7854f1a8e251c5c34b3100880a8637"), 100) == null, "output limit is enforced")
+    expect(qrZlibInflate("", 100) == null, "empty stream")
+    expect(qrZlibInflate(fromHex("7801"), 100) == null, "header only")
+    expect(qrZlibInflate(fromHex("7901ffffffff"), 100) == null, "bad header check")
+
+    // Every colour type and depth, filtered and interlaced, from the hand-made files.
+    val folder = "tests/fixtures/png/"
+    val lines = Path(folder + "expected.txt").readText().trim().split("\n")
+    expectEqual(lines.size, 30, "fixture count")
+    for (line in lines) {
+        val parts = line.split("|")
+        val decoded = qrPngDecode(Path(folder + parts[0]).readText())
+        val image = decoded.image
+        if (image != null) {
+            expectEqual(image.width, 11, "${parts[0]} width")
+            expectEqual(image.height, 7, "${parts[0]} height")
+            val expected = parts[1].split(" ")
+            var wrong = 0
+            for (index in 0 until expected.size) if (int(image.pixels[index]) != parseInt(expected[index])) wrong += 1
+            expectEqual(wrong, 0, "${parts[0]} pixels")
+        } else expect(false, "${parts[0]}: ${decoded.error}")
+    }
+
+    // Malformed files come back as errors.
+    val matrix = qrEncode("png").matrix
+    if (matrix != null) {
+        val good = qrPng(matrix)
+        expect(qrPngDecode(good).succeeded, "good file")
+        expectEqual(errorOf(""), "not_png", "empty")
+        expectEqual(errorOf("not a png at all, just some text in a string"), "not_png", "text")
+        expectEqual(errorOf(good.slice(0, 40)), "truncated", "truncated in a chunk")
+        expectEqual(errorOf(good.slice(0, good.size - 12)), "truncated", "no IEND")
+        expectEqual(errorOf(replaced(good, 20, good[20] ^ 1)), "bad_crc", "corrupt header")
+        expectEqual(qrPngDecode(good, 100).error, "too_large", "pixel limit")
+
+        // Any single corrupted byte, and random truncations: an error or an image, no panic.
+        val random = TestRandom(31337)
+        var rejected = 0
+        for (trial in 0 until 2000) {
+            val at = random.next(good.size)
+            val result = qrPngDecode(replaced(good, at, random.next(256)))
+            if (!result.succeeded) rejected += 1
+        }
+        expect(rejected > 1500, "CRCs catch corruption")
+        for (trial in 0 until 300) {
+            qrPngDecode(good.slice(0, random.next(good.size)))
+        }
+        // Hostile CRC-valid chunks reach the decompressor.
+        for (trial in 0 until 2000) {
+            val body = byteBuffer()
+            body.appendByteValue(0x78)
+            body.appendByteValue(0x01)
+            for (index in 0 until random.next(200)) body.appendByteValue(random.next(256))
+            qrZlibInflate(body.toText(), 10000)
+        }
+        expect(true, "no panic on noise")
+    } else expect(false, "encodes")
+
+    val sized = qrImageFromBytes(2, 1, 3, "\xFF\xFF\xFF\x00\x00\x00")
+    val small = sized.image
+    if (small != null) {
+        expectEqual(int(small.pixels[0]), 255, "white")
+        expectEqual(int(small.pixels[1]), 0, "black")
+    } else expect(false, "image from bytes")
+    expectEqual(qrImageFromBytes(2, 2, 1, "abc").error, "size_mismatch", "short data")
+    expectEqual(qrImageFromBytes(0, 2, 1, "").error, "invalid_size", "no width")
+    expectEqual(qrImageFromBytes(1, 1, 5, "abcde").error, "invalid_channels", "channels")
+    expectEqual(qrLuma(0, 0, 0, 0), 255, "transparent black over white")
+    testsPassed()
+}

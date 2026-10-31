@@ -1,0 +1,76 @@
+import "abla/test"
+import "abla/text"
+import "../src/qr.ab"
+
+private fun encoded(text: string): QrMatrix? = qrEncode(text).matrix
+
+fun main: int {
+    val matrix = encoded("render")
+    if (matrix == null) {
+        expect(false, "encodes")
+        return testsPassed()
+    }
+    val size = matrix.size
+
+    val svg = qrSvg(matrix)
+    expect(svg.startsWith("<svg xmlns=\"http://www.w3.org/2000/svg\""), "svg root")
+    expect(svg.contains("viewBox=\"0 0 ${size + 8} ${size + 8}\""), "viewBox has the quiet zone")
+    expect(svg.contains("width=\"${(size + 8) * 8}\""), "pixel size from the scale")
+    expect(svg.contains("fill=\"#ffffff\""), "light background")
+    expect(svg.contains("fill=\"#000000\""), "dark path")
+    expect(svg.contains("M4 4h7v1h-7z"), "first finder row merges into one run")
+
+    val styled = qrSvg(matrix, QrRenderOptions(scale = 2, border = 0, darkColor = 0x12AB9F, lightColor = 0x0000FF))
+    expect(styled.contains("fill=\"#12ab9f\""), "dark colour")
+    expect(styled.contains("fill=\"#0000ff\""), "light colour")
+    expect(styled.contains("viewBox=\"0 0 $size $size\""), "no border")
+    expect(styled.contains("M0 0h7v1h-7z"), "no border offset")
+
+    val clear = qrSvg(matrix, QrRenderOptions(transparentBackground = true))
+    expect(!clear.contains("<rect"), "transparent has no background")
+
+    // Out of range options are clamped, not obeyed.
+    val clamped = qrSvg(matrix, QrRenderOptions(scale = -3, border = -1))
+    expect(clamped.contains("viewBox=\"0 0 $size $size\""), "negative border")
+    expect(clamped.contains("width=\"$size\""), "negative scale")
+
+    // PNG output decodes to exactly the modules, at every scale tried.
+    for (scale in [1, 2, 3, 5, 8, 11, 16]) {
+        for (border in [0, 1, 4, 7]) {
+            val png = qrPng(matrix, QrRenderOptions(scale = scale, border = border))
+            expect(png.size > 0, "png scale $scale border $border")
+            val decoded = qrPngDecode(png)
+            val image = decoded.image
+            if (image != null) {
+                val side = (size + border * 2) * scale
+                expectEqual(image.width, side, "png width")
+                expectEqual(image.height, side, "png height")
+                var same = true
+                for (y in 0 until side) {
+                    for (x in 0 until side) {
+                        val mx = x / scale - border
+                        val my = y / scale - border
+                        val dark = mx >= 0 && my >= 0 && mx < size && my < size && matrix.dark(mx, my)
+                        if ((int(image.pixels[y * side + x]) == 0) != dark) same = false
+                    }
+                }
+                expect(same, "png pixels scale $scale border $border")
+            } else expect(false, "png decodes: ${decoded.error}")
+        }
+    }
+
+    // Colours and transparency, by way of the decoder's compositing over white.
+    val colored = qrPngDecode(qrPng(matrix, QrRenderOptions(scale = 1, border = 1, darkColor = 0x102030, lightColor = 0xF0E0D0))).image
+    if (colored != null) {
+        expectEqual(int(colored.pixels[0]), qrLuma(0xF0, 0xE0, 0xD0, 255), "light colour pixel")
+        expectEqual(int(colored.pixels[colored.width + 1]), qrLuma(0x10, 0x20, 0x30, 255), "dark colour pixel")
+    } else expect(false, "coloured png decodes")
+    val see = qrPngDecode(qrPng(matrix, QrRenderOptions(scale = 1, border = 1, lightColor = 0x000000, transparentBackground = true))).image
+    if (see != null) expectEqual(int(see.pixels[0]), 255, "transparent light module over white")
+    else expect(false, "transparent png decodes")
+
+    val text = qrMatrixText(matrix)
+    expectEqual(text.split("\n").size, size + 1, "matrix text rows")
+    expect(text.startsWith("1111111"), "matrix text starts on the finder")
+    testsPassed()
+}

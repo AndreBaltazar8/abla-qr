@@ -1,0 +1,154 @@
+// SVG and PNG output for a module matrix.
+
+import "abla/bytes"
+import "abla/text"
+import "abla/compression/gzip"
+import "matrix.ab"
+import "png.ab"
+
+class QrRenderOptions(
+    // Pixels per module, 1 to 64.
+    val scale: int = 8,
+    // Quiet zone in modules, 0 to 64; the standard asks for at least 4.
+    val border: int = 4,
+    // Colours as 0xRRGGBB.
+    val darkColor: int = 0x000000,
+    val lightColor: int = 0xFFFFFF,
+    val transparentBackground: bool = false
+)
+
+private fun clampInt(value: int, low: int, high: int): int =
+    if (value < low) low else if (value > high) high else value
+
+private fun hexColor(color: int): string {
+    val digits = "0123456789abcdef"
+    val parts: array<string> = ["#"]
+    var shift = 20
+    while (shift >= 0) {
+        val digit = (color >>> shift) & 15
+        parts.append(digits.slice(digit, digit + 1))
+        shift -= 4
+    }
+    textJoin(parts)
+}
+
+// A scalable image. Runs of dark modules merge into one path, so codes stay
+// small and show no seams between modules.
+fun qrSvg(matrix: QrMatrix, options: QrRenderOptions = QrRenderOptions()): string {
+    val border = clampInt(options.border, 0, 64)
+    val scale = clampInt(options.scale, 1, 64)
+    val extent = matrix.size + border * 2
+    val pixels = extent * scale
+    val out = byteBuffer()
+    out.appendText("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"$pixels\" height=\"$pixels\" viewBox=\"0 0 $extent $extent\" shape-rendering=\"crispEdges\">")
+    if (!options.transparentBackground)
+        out.appendText("<rect width=\"$extent\" height=\"$extent\" fill=\"${hexColor(options.lightColor)}\"/>")
+    out.appendText("<path fill=\"${hexColor(options.darkColor)}\" d=\"")
+    for (y in 0 until matrix.size) {
+        var x = 0
+        while (x < matrix.size) {
+            if (matrix.dark(x, y)) {
+                var end = x + 1
+                while (end < matrix.size && matrix.dark(end, y)) end += 1
+                out.appendText("M${x + border} ${y + border}h${end - x}v1h${x - end}z")
+                x = end
+            } else {
+                x += 1
+            }
+        }
+    }
+    out.appendText("\"/></svg>\n")
+    out.toText()
+}
+
+private fun appendU32(var out: ByteBuffer, value: int): void {
+    out.appendByteValue((value >>> 24) & 255)
+    out.appendByteValue((value >>> 16) & 255)
+    out.appendByteValue((value >>> 8) & 255)
+    out.appendByteValue(value & 255)
+    return
+}
+
+private fun appendChunk(var out: ByteBuffer, kind: string, data: string): void {
+    appendU32(out, data.size)
+    out.appendText(kind)
+    out.appendText(data)
+    appendU32(out, qrPngCrc32(kind + data))
+    return
+}
+
+private fun u32Text(value: int): string {
+    val out = byteBuffer()
+    appendU32(out, value)
+    out.toText()
+}
+
+private fun rgbText(color: int): string {
+    val out = byteBuffer()
+    out.appendByteValue((color >>> 16) & 255)
+    out.appendByteValue((color >>> 8) & 255)
+    out.appendByteValue(color & 255)
+    out.toText()
+}
+
+private fun zlibWrap(data: string): string {
+    val gzip = gzipCompress(data)
+    val out = byteBuffer()
+    out.appendByteValue(0x78)
+    out.appendByteValue(0x01)
+    // A gzip member is a 10-byte header, the DEFLATE stream and an 8-byte trailer.
+    out.appendText(gzip.slice(10, gzip.size - 8))
+    appendU32(out, qrPngAdler32(data))
+    out.toText()
+}
+
+// A one-bit PNG: palette index 0 is the light colour, 1 the dark one.
+fun qrPng(matrix: QrMatrix, options: QrRenderOptions = QrRenderOptions()): string {
+    val border = clampInt(options.border, 0, 64)
+    val scale = clampInt(options.scale, 1, 64)
+    val pixels = (matrix.size + border * 2) * scale
+    val raw = byteBuffer()
+    for (y in 0 until matrix.size + border * 2) {
+        val row = byteBuffer()
+        row.appendByteValue(0)
+        var current = 0
+        var filled = 0
+        for (x in 0 until matrix.size + border * 2) {
+            val dark = y >= border && y < matrix.size + border &&
+                x >= border && x < matrix.size + border && matrix.dark(x - border, y - border)
+            for (repeat in 0 until scale) {
+                current = (current << 1) | (if (dark) 1 else 0)
+                filled += 1
+                if (filled == 8) {
+                    row.appendByteValue(current)
+                    current = 0
+                    filled = 0
+                }
+            }
+        }
+        if (filled > 0) row.appendByteValue(current << (8 - filled))
+        val text = row.toText()
+        for (copy in 0 until scale) raw.appendText(text)
+    }
+
+    val out = byteBuffer()
+    out.appendText(qrPngSignature())
+    val header = byteBuffer()
+    appendU32(header, pixels)
+    appendU32(header, pixels)
+    header.appendByteValue(1)
+    header.appendByteValue(3)
+    header.appendByteValue(0)
+    header.appendByteValue(0)
+    header.appendByteValue(0)
+    appendChunk(out, "IHDR", header.toText())
+    appendChunk(out, "PLTE", rgbText(options.lightColor) + rgbText(options.darkColor))
+    if (options.transparentBackground) {
+        val alpha = byteBuffer()
+        alpha.appendByteValue(0)
+        appendChunk(out, "tRNS", alpha.toText())
+    }
+    appendChunk(out, "IDAT", zlibWrap(raw.toText()))
+    appendChunk(out, "IEND", "")
+    out.toText()
+}
