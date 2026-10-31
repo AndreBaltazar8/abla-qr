@@ -1,0 +1,288 @@
+// QR code creation.
+
+import "abla/text"
+import "tables.ab"
+import "reedsolomon.ab"
+import "matrix.ab"
+
+// One run of data in one mode. `eci` above -1 prefixes an ECI designator.
+class QrSegment(val mode: int, val data: string, val eci: int = -1)
+
+class QrOptions(
+    val errorCorrection: QrErrorCorrection = qrEcMedium,
+    val minVersion: int = 1,
+    val maxVersion: int = 40,
+    val mask: int = -1,
+    // Raise the level when the chosen version has room for it.
+    val boostErrorCorrection: bool = false,
+    // Mark byte data as UTF-8 with ECI 26. Most readers guess UTF-8 without it.
+    val utf8Eci: bool = false
+)
+
+class QrEncodeResult(val succeeded: bool, val error: string, val matrix: QrMatrix?)
+
+private fun failed(error: string): QrEncodeResult = QrEncodeResult(false, error, null)
+
+private class BitWriter(val bytes: array<int>, var bitCount: int) {
+    fun append(value: int, count: int): void {
+        var index = count - 1
+        while (index >= 0) {
+            if (this.bitCount % 8 == 0) this.bytes.append(0)
+            val bit = (value >>> index) & 1
+            val last = this.bytes.size - 1
+            this.bytes[last] = this.bytes[last] | (bit << (7 - this.bitCount % 8))
+            this.bitCount += 1
+            index -= 1
+        }
+        return
+    }
+}
+
+fun qrIsNumeric(text: string): bool {
+    for (byte in text) if (byte < 48 || byte > 57) return false
+    true
+}
+
+fun qrIsAlphanumeric(text: string): bool {
+    for (byte in text) if (qrAlphanumericValue(byte) < 0) return false
+    true
+}
+
+// The most compact single mode for this data.
+fun qrSegmentFor(data: string, utf8Eci: bool = false): QrSegment {
+    if (qrIsNumeric(data)) return QrSegment(qrModeNumeric, data)
+    if (qrIsAlphanumeric(data)) return QrSegment(qrModeAlphanumeric, data)
+    QrSegment(qrModeByte, data, if (utf8Eci) 26 else -1)
+}
+
+private fun payloadBits(segment: QrSegment): int {
+    val count = segment.data.size
+    if (segment.mode == qrModeNumeric) return count / 3 * 10 + (if (count % 3 == 0) 0 else count % 3 * 3 + 1)
+    if (segment.mode == qrModeAlphanumeric) return count / 2 * 11 + count % 2 * 6
+    count * 8
+}
+
+private fun eciBits(eci: int): int =
+    if (eci < 0) 0 else if (eci < 128) 12 else if (eci < 16384) 20 else 28
+
+// Bits these segments take in a version, or -1 when a count doesn't fit its field.
+fun qrSegmentBits(segments: array<QrSegment>, version: int): int {
+    var total = 0
+    for (segment in segments) {
+        val countBits = qrCharCountBits(segment.mode, version)
+        if (segment.data.size >= (1 << countBits)) return -1
+        total += eciBits(segment.eci) + 4 + countBits + payloadBits(segment)
+    }
+    total
+}
+
+private fun appendSegment(var writer: BitWriter, segment: QrSegment, version: int): void {
+    if (segment.eci >= 0) {
+        writer.append(7, 4)
+        if (segment.eci < 128) {
+            writer.append(segment.eci, 8)
+        } else if (segment.eci < 16384) {
+            writer.append(2, 2)
+            writer.append(segment.eci, 14)
+        } else {
+            writer.append(6, 3)
+            writer.append(segment.eci, 21)
+        }
+    }
+    writer.append(segment.mode, 4)
+    writer.append(segment.data.size, qrCharCountBits(segment.mode, version))
+    val data = segment.data
+    if (segment.mode == qrModeNumeric) {
+        var index = 0
+        while (index < data.size) {
+            val take = if (data.size - index >= 3) 3 else data.size - index
+            var value = 0
+            for (offset in 0 until take) value = value * 10 + data[index + offset] - 48
+            writer.append(value, take * 3 + 1)
+            index += take
+        }
+    } else if (segment.mode == qrModeAlphanumeric) {
+        var index = 0
+        while (index + 1 < data.size) {
+            writer.append(qrAlphanumericValue(data[index]) * 45 + qrAlphanumericValue(data[index + 1]), 11)
+            index += 2
+        }
+        if (index < data.size) writer.append(qrAlphanumericValue(data[index]), 6)
+    } else {
+        for (byte in data) writer.append(byte, 8)
+    }
+    return
+}
+
+private fun segmentValid(segment: QrSegment): bool {
+    if (segment.mode == qrModeNumeric) return qrIsNumeric(segment.data)
+    if (segment.mode == qrModeAlphanumeric) return qrIsAlphanumeric(segment.data)
+    segment.mode == qrModeByte && segment.eci < 1000000
+}
+
+// Data codewords followed by interleaved check codewords.
+private fun interleaved(data: array<int>, version: int, ec: QrErrorCorrection): array<int> {
+    val blocks = qrBlockCount(version, ec)
+    val eccLength = qrEccCodewordsPerBlock(version, ec)
+    val total = qrTotalCodewords(version)
+    val shortBlocks = blocks - total % blocks
+    val shortData = total / blocks - eccLength
+    val divisor = qrRsGenerator(eccLength)
+    val dataBlocks: array<array<int>> = []
+    val eccBlocks: array<array<int>> = []
+    var offset = 0
+    for (block in 0 until blocks) {
+        val length = if (block < shortBlocks) shortData else shortData + 1
+        val piece = filledArray(length, 0)
+        for (index in 0 until length) piece[index] = data[offset + index]
+        offset += length
+        dataBlocks.append(piece)
+        eccBlocks.append(qrRsRemainder(piece, divisor))
+    }
+    val result: array<int> = []
+    for (index in 0..shortData)
+        for (block in 0 until blocks)
+            if (index < dataBlocks[block].size) result.append(dataBlocks[block][index])
+    for (index in 0 until eccLength)
+        for (block in 0 until blocks)
+            result.append(eccBlocks[block][index])
+    result
+}
+
+private fun drawFormatAndVersion(var modules: array<bool>, size: int, version: int, ec: QrErrorCorrection, mask: int): void {
+    val word = qrFormatWord(ec, mask)
+    for (copy in 0..1) {
+        val places = qrFormatPlaces(size, copy)
+        for (index in 0 until 15) modules[places[index]] = ((word >>> index) & 1) == 1
+    }
+    if (version >= 7) {
+        val versionWord = qrVersionWord(version)
+        for (copy in 0..1) {
+            val places = qrVersionPlaces(size, copy)
+            for (index in 0 until 18) modules[places[index]] = ((versionWord >>> index) & 1) == 1
+        }
+    }
+    return
+}
+
+// The four penalty rules of the standard; the lowest score picks the mask.
+fun qrMaskPenalty(modules: array<bool>, size: int): int {
+    var score = 0
+    var darkCount = 0
+    for (first in 0 until size) {
+        for (direction in 0..1) {
+            var run = 0
+            var previous = false
+            var window = 0
+            for (second in 0 until size) {
+                val place = if (direction == 0) first * size + second else second * size + first
+                val value = modules[place]
+                if (direction == 0 && value) darkCount += 1
+                if (second > 0 && value == previous) {
+                    run += 1
+                    if (run == 5) score += 3
+                    else if (run > 5) score += 1
+                } else {
+                    run = 1
+                }
+                previous = value
+                window = ((window << 1) | (if (value) 1 else 0)) & 0x7FF
+                if (second >= 10 && (window == 0x5D0 || window == 0x05D)) score += 40
+            }
+        }
+    }
+    for (y in 0 until size - 1) {
+        for (x in 0 until size - 1) {
+            val value = modules[y * size + x]
+            if (value == modules[y * size + x + 1] && value == modules[(y + 1) * size + x] &&
+                value == modules[(y + 1) * size + x + 1]) score += 3
+        }
+    }
+    val total = size * size
+    val deviation = if (darkCount * 20 > total * 10) darkCount * 20 - total * 10 else total * 10 - darkCount * 20
+    score + deviation / total * 10
+}
+
+private fun buildMatrix(codewords: array<int>, version: int, ec: QrErrorCorrection, requestedMask: int): QrMatrix {
+    val layout = qrLayout(version)
+    val size = layout.size
+    val path = qrDataPath(version)
+    val base = filledArray(size * size, false)
+    for (place in 0 until size * size) base[place] = layout.dark[place]
+    for (index in 0 until path.size) {
+        val bit = index < codewords.size * 8 &&
+            ((codewords[index / 8] >>> (7 - index % 8)) & 1) == 1
+        base[path[index]] = bit
+    }
+    var bestMask = requestedMask
+    if (bestMask < 0) {
+        var bestScore = -1
+        for (mask in 0 until 8) {
+            val score = qrMaskPenalty(applyMask(base, path, size, version, ec, mask), size)
+            if (bestScore < 0 || score < bestScore) {
+                bestScore = score
+                bestMask = mask
+            }
+        }
+    }
+    QrMatrix(size, applyMask(base, path, size, version, ec, bestMask), version, ec, bestMask)
+}
+
+private fun applyMask(base: array<bool>, path: array<int>, size: int, version: int, ec: QrErrorCorrection, mask: int): array<bool> {
+    val modules = filledArray(base.size, false)
+    for (place in 0 until base.size) modules[place] = base[place]
+    for (place in path)
+        if (qrMaskBit(mask, place % size, place / size)) modules[place] = !modules[place]
+    drawFormatAndVersion(modules, size, version, ec, mask)
+    modules
+}
+
+// Encodes segments in the smallest version that holds them.
+fun qrEncodeSegments(segments: array<QrSegment>, options: QrOptions = QrOptions()): QrEncodeResult {
+    if (options.minVersion < qrMinVersion || options.maxVersion > qrMaxVersion ||
+        options.minVersion > options.maxVersion) return failed("invalid_version_range")
+    if (options.mask < -1 || options.mask > 7) return failed("invalid_mask")
+    if (options.errorCorrection < 0 || options.errorCorrection > 3) return failed("invalid_error_correction")
+    for (segment in segments) if (!segmentValid(segment)) return failed("invalid_segment")
+
+    var version = options.minVersion
+    var used = -1
+    while (version <= options.maxVersion) {
+        used = qrSegmentBits(segments, version)
+        if (used >= 0 && used <= qrDataCodewords(version, options.errorCorrection) * 8) break
+        version += 1
+    }
+    if (version > options.maxVersion) return failed("data_too_long")
+
+    var ec = options.errorCorrection
+    if (options.boostErrorCorrection) {
+        while (ec < qrEcHigh && used <= qrDataCodewords(version, QrErrorCorrection(ec + 1)) * 8)
+            ec = QrErrorCorrection(ec + 1)
+    }
+
+    val writer = BitWriter(array<int>(), 0)
+    for (segment in segments) appendSegment(writer, segment, version)
+    val capacity = qrDataCodewords(version, ec) * 8
+    val terminator = if (capacity - writer.bitCount < 4) capacity - writer.bitCount else 4
+    writer.append(0, terminator)
+    writer.append(0, (8 - writer.bitCount % 8) % 8)
+    var pad = 0xEC
+    while (writer.bitCount < capacity) {
+        writer.append(pad, 8)
+        pad = pad ^ 0xEC ^ 0x11
+    }
+    val matrix = buildMatrix(interleaved(writer.bytes, version, ec), version, ec, options.mask)
+    QrEncodeResult(true, "", matrix)
+}
+
+// Encodes text or bytes, choosing numeric, alphanumeric or byte mode.
+fun qrEncode(data: string, options: QrOptions = QrOptions()): QrEncodeResult {
+    if (options.utf8Eci && !data.isValidUtf8()) return failed("invalid_utf8")
+    qrEncodeSegments([qrSegmentFor(data, options.utf8Eci)], options)
+}
+
+// Encodes in byte mode whatever the data looks like.
+fun qrEncodeBytes(data: string, options: QrOptions = QrOptions()): QrEncodeResult {
+    if (options.utf8Eci && !data.isValidUtf8()) return failed("invalid_utf8")
+    qrEncodeSegments([QrSegment(qrModeByte, data, if (options.utf8Eci) 26 else -1)], options)
+}

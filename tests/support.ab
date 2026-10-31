@@ -1,0 +1,13 @@
+// Helpers shared by the test programs.
+
+import "../src/qr.ab"
+
+// A small deterministic generator, so a failure repeats.
+class TestRandom(var state: int) {
+    fun next(limit: int): int {
+        this.state = (this.state * 1103515245 + 12345) & 0x7FFFFFFF
+        (this.state >>> 8) % limit
+    }
+}
+
+fun testMatrix(data: string, options: QrOptions = QrOptions()): QrMatrix? = qrEncode(data, options).matrix

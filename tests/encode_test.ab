@@ -1,0 +1,106 @@
+import "abla/test"
+import "abla/text"
+import "support.ab"
+import "../src/qr.ab"
+
+private fun textOf(result: QrEncodeResult): string {
+    val matrix = result.matrix
+    if (matrix == null) return "failed: ${result.error}"
+    qrMatrixText(matrix)
+}
+
+private fun versionOf(result: QrEncodeResult): int {
+    val matrix = result.matrix
+    if (matrix == null) return -1
+    matrix.version
+}
+
+private fun failure(result: QrEncodeResult): string = if (result.succeeded) "" else result.error
+
+// The example of Annex I of the standard: 01234567 at 1-M with mask 2.
+private val annexI = "111111100101101111111\n100000100111101000001\n101110101000001011101\n101110101100001011101\n101110101011101011101\n100000101000101000001\n111111101010101111111\n000000001001100000000\n101111100100101111100\n000101011010100101100\n001000110101010011111\n000010000100000111100\n000111111001010010000\n000000001011111001100\n111111100110101100000\n100000101011111000101\n101110101000100101100\n101110101100100100000\n101110101011010010100\n100000100000000110110\n111111101111010010100\n"
+
+fun main: int {
+    expectEqual(textOf(qrEncode("01234567", QrOptions(mask = 2))), annexI, "Annex I example")
+
+    // Automatic mode selection shows in what fits where.
+    expectEqual(versionOf(qrEncode("12345678901234567890123456789012345678901", QrOptions(errorCorrection = qrEcLow))), 1, "41 digits fit 1-L")
+    expectEqual(versionOf(qrEncode("ABCDEFGHIJKLMNOPQRSTUVWXY", QrOptions(errorCorrection = qrEcLow))), 1, "25 alphanumeric fit 1-L")
+    expectEqual(versionOf(qrEncode("abcdefghijklmnopq", QrOptions(errorCorrection = qrEcLow))), 1, "17 bytes fit 1-L")
+    expectEqual(versionOf(qrEncode("abcdefghijklmnopqr", QrOptions(errorCorrection = qrEcLow))), 2, "18 bytes need version 2")
+    expectEqual(versionOf(qrEncodeBytes("12345678901234567890", QrOptions(errorCorrection = qrEcLow))), 2, "digits forced to byte mode")
+
+    // The largest capacity of the standard, and one past it.
+    val low = QrOptions(errorCorrection = qrEcLow)
+    expectEqual(versionOf(qrEncode("1".repeat(7089), low)), 40, "7089 digits")
+    expectEqual(failure(qrEncode("1".repeat(7090), low)), "data_too_long", "7090 digits")
+    expectEqual(versionOf(qrEncode("A".repeat(4296), low)), 40, "4296 alphanumeric")
+    expectEqual(failure(qrEncode("A".repeat(4297), low)), "data_too_long", "4297 alphanumeric")
+    expectEqual(versionOf(qrEncode("a".repeat(2953), low)), 40, "2953 bytes")
+    expectEqual(failure(qrEncode("a".repeat(2954), low)), "data_too_long", "2954 bytes")
+    val high = QrOptions(errorCorrection = qrEcHigh)
+    expectEqual(versionOf(qrEncode("a".repeat(1273), high)), 40, "1273 bytes at H")
+    expectEqual(failure(qrEncode("a".repeat(1274), high)), "data_too_long", "1274 bytes at H")
+
+    // Options.
+    expectEqual(versionOf(qrEncode("hi", QrOptions(minVersion = 5))), 5, "minimum version")
+    expectEqual(failure(qrEncode("a".repeat(100), QrOptions(maxVersion = 2))), "data_too_long", "maximum version")
+    expectEqual(failure(qrEncode("a", QrOptions(minVersion = 0))), "invalid_version_range", "version 0")
+    expectEqual(failure(qrEncode("a", QrOptions(maxVersion = 41))), "invalid_version_range", "version 41")
+    expectEqual(failure(qrEncode("a", QrOptions(minVersion = 9, maxVersion = 3))), "invalid_version_range", "reversed range")
+    expectEqual(failure(qrEncode("a", QrOptions(mask = 8))), "invalid_mask", "mask 8")
+    expectEqual(failure(qrEncode("a", QrOptions(errorCorrection = QrErrorCorrection(4)))), "invalid_error_correction", "level 4")
+    expectEqual(failure(qrEncode("caf\xC3", QrOptions(utf8Eci = true))), "invalid_utf8", "ECI needs UTF-8")
+    expectEqual(failure(qrEncodeSegments([QrSegment(qrModeNumeric, "12a")])), "invalid_segment", "letters in numeric")
+    expectEqual(failure(qrEncodeSegments([QrSegment(qrModeAlphanumeric, "abc")])), "invalid_segment", "lower case in alphanumeric")
+    expectEqual(failure(qrEncodeSegments([QrSegment(qrModeKanji, "abc")])), "invalid_segment", "kanji can't be created")
+
+    val boosted = qrEncode("hi", QrOptions(errorCorrection = qrEcLow, boostErrorCorrection = true)).matrix
+    if (boosted != null) expectEqual(qrEcName(boosted.errorCorrection), "H", "boost uses the room left")
+    else expect(false, "boost encodes")
+
+    // Every mask draws, carries its number, and auto picks the lowest penalty.
+    val auto = qrEncode("mask selection test").matrix
+    if (auto != null) {
+        val autoScore = qrMaskPenalty(auto.modules, auto.size)
+        for (mask in 0 until 8) {
+            val forced = qrEncode("mask selection test", QrOptions(mask = mask)).matrix
+            if (forced != null) {
+                expectEqual(forced.mask, mask, "mask $mask recorded")
+                expect(autoScore <= qrMaskPenalty(forced.modules, forced.size), "auto beats mask $mask")
+            } else expect(false, "mask $mask encodes")
+        }
+    } else expect(false, "auto mask encodes")
+
+    // A penalty by hand: all light 21x21.
+    val light = filledArray(441, false)
+    // Rule 1: 21 rows and columns of 21, 3 + 16 each. Rule 2: 400 blocks. Rule 4: 50% off, 10 steps.
+    expectEqual(qrMaskPenalty(light, 21), 42 * 19 + 400 * 3 + 100, "all light penalty")
+
+    // Function patterns in every version.
+    for (version in 1..40) {
+        val matrix = qrEncode("x", QrOptions(minVersion = version, maxVersion = version)).matrix
+        if (matrix != null) {
+            val size = matrix.size
+            var patternsHold = true
+            for (index in 8 until size - 8) {
+                if (matrix.dark(index, 6) != (index % 2 == 0)) patternsHold = false
+                if (matrix.dark(6, index) != (index % 2 == 0)) patternsHold = false
+            }
+            for (corner in 0..2) {
+                val cx = if (corner == 1) size - 7 else 0
+                val cy = if (corner == 2) size - 7 else 0
+                for (y in 0 until 7) for (x in 0 until 7) {
+                    val ring = if (x == 0 || y == 0 || x == 6 || y == 6) true
+                        else if (x == 1 || y == 1 || x == 5 || y == 5) false
+                        else true
+                    if (matrix.dark(cx + x, cy + y) != ring) patternsHold = false
+                }
+            }
+            expect(matrix.dark(8, size - 8), "dark module of v$version")
+            expect(patternsHold, "finder and timing of v$version")
+            expectEqual(qrDataPath(version).size, qrRawDataModules(version), "data path of v$version")
+        } else expect(false, "v$version encodes")
+    }
+    testsPassed()
+}

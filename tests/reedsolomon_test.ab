@@ -1,0 +1,80 @@
+import "abla/test"
+import "support.ab"
+import "../src/qr.ab"
+
+private fun listText(values: array<int>): string {
+    var out = ""
+    for (value in values) out = "$out$value,"
+    out
+}
+
+private fun copyOf(values: array<int>): array<int> {
+    val out: array<int> = []
+    for (value in values) out.append(value)
+    out
+}
+
+fun main: int {
+    expectEqual(qrGfMultiply(0, 200), 0, "times zero")
+    expectEqual(qrGfMultiply(1, 200), 200, "times one")
+    expectEqual(qrGfMultiply(2, 128), 29, "reduction by the polynomial")
+    for (a in 1 until 256) expectEqual(qrGfMultiply(a, qrGfDivide(1, a)), 1, "inverse of $a")
+    expectEqual(qrGfDivide(5, 0), 0, "division by zero doesn't panic")
+
+    // Annex A: the generator of degree 7 is a^0 x^7 + a^87 x^6 + a^229 x^5 + ...
+    expectEqual(listText(qrRsGenerator(7)), "127,122,154,164,11,68,117,", "generator 7")
+
+    // Thonky's worked example: HELLO WORLD at 1-M.
+    val data: array<int> = [32, 91, 11, 120, 209, 114, 220, 77, 67, 64, 236, 17, 236, 17, 236, 17]
+    val ecc = qrRsRemainder(data, qrRsGenerator(10))
+    expectEqual(listText(ecc), "196,35,39,119,235,215,231,226,93,23,", "HELLO WORLD check bytes")
+
+    val clean = copyOf(data)
+    for (byte in ecc) clean.append(byte)
+
+    val untouched = copyOf(clean)
+    expectEqual(qrRsCorrect(untouched, 10, 5), 0, "clean codeword needs nothing")
+    expectEqual(listText(untouched), listText(clean), "clean codeword unchanged")
+
+    val random = TestRandom(7)
+    for (eccLength in [7, 10, 13, 17, 22, 30]) {
+        val message = filledArray(40, 0)
+        for (index in 0 until message.size) message[index] = random.next(256)
+        val code = copyOf(message)
+        for (byte in qrRsRemainder(message, qrRsGenerator(eccLength))) code.append(byte)
+        val capacity = eccLength / 2
+        for (errors in 0..capacity) {
+            for (trial in 0 until 40) {
+                val broken = copyOf(code)
+                val hit = filledArray(code.size, false)
+                var placed = 0
+                while (placed < errors) {
+                    val place = random.next(code.size)
+                    if (!hit[place]) {
+                        hit[place] = true
+                        broken[place] = broken[place] ^ (1 + random.next(255))
+                        placed += 1
+                    }
+                }
+                val repaired = qrRsCorrect(broken, eccLength, capacity)
+                expectEqual(repaired, errors, "ecc $eccLength errors $errors")
+                expectEqual(listText(broken), listText(code), "ecc $eccLength errors $errors repaired")
+            }
+        }
+        // Past capacity it must not claim the original: fail or land elsewhere.
+        for (trial in 0 until 200) {
+            val broken = copyOf(code)
+            for (index in 0..capacity) broken[index * 2] = broken[index * 2] ^ (1 + random.next(255))
+            val repaired = qrRsCorrect(broken, eccLength, capacity)
+            expect(repaired != capacity + 1, "ecc $eccLength over capacity")
+            expect(repaired < 0 || listText(broken) != listText(code), "ecc $eccLength over capacity isn't the original")
+        }
+    }
+    // Misdecode protection in the short blocks.
+    expectEqual(qrRsCapacity(7), 2, "1-L corrects 2")
+    expectEqual(qrRsCapacity(10), 4, "1-M corrects 4")
+    expectEqual(qrRsCapacity(13), 6, "1-Q corrects 6")
+    expectEqual(qrRsCapacity(17), 8, "1-H corrects 8")
+    expectEqual(qrRsCapacity(30), 15, "large blocks correct half")
+    testsPassed()
+}
