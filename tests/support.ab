@@ -1,5 +1,7 @@
 // Helpers shared by the test programs.
 
+import "abla/float"
+import "abla/math"
 import "../src/qr.ab"
 
 // A small deterministic generator, so a failure repeats.
@@ -11,3 +13,72 @@ class TestRandom(var state: int) {
 }
 
 fun testMatrix(data: string, options: QrOptions = QrOptions()): QrMatrix? = qrEncode(data, options).matrix
+
+fun testImage(matrix: QrMatrix, scale: int, border: int): QrImage {
+    val side = (matrix.size + border * 2) * scale
+    val pixels = filledArray(side * side, u8(255))
+    for (y in 0 until side) {
+        for (x in 0 until side) {
+            val mx = x / scale - border
+            val my = y / scale - border
+            if (mx >= 0 && my >= 0 && mx < matrix.size && my < matrix.size && matrix.dark(mx, my))
+                pixels[y * side + x] = u8(0)
+        }
+    }
+    QrImage(side, side, pixels)
+}
+
+// Places `image` on a larger canvas through an inverse mapping from output to
+// input pixels, with bilinear interpolation.
+fun testWarp(image: QrImage, width: int, height: int, background: int, map: (f64, f64) -> array<f64>): QrImage {
+    val pixels = filledArray(width * height, u8(background))
+    for (y in 0 until height) {
+        for (x in 0 until width) {
+            val source = map(f64FromInt(x) + 0.5, f64FromInt(y) + 0.5)
+            val sx = source[0] - 0.5
+            val sy = source[1] - 0.5
+            if (sx >= 0.0 && sy >= 0.0) {
+                val left = f64ToInt(sx)
+                val top = f64ToInt(sy)
+                if (left + 1 < image.width && top + 1 < image.height) {
+                    val s = sx - f64FromInt(left)
+                    val t = sy - f64FromInt(top)
+                    val at = top * image.width + left
+                    val a = f64FromInt(int(image.pixels[at]))
+                    val b = f64FromInt(int(image.pixels[at + 1]))
+                    val c = f64FromInt(int(image.pixels[at + image.width]))
+                    val d = f64FromInt(int(image.pixels[at + image.width + 1]))
+                    val value = (a * (1.0 - s) + b * s) * (1.0 - t) + (c * (1.0 - s) + d * s) * t
+                    pixels[y * width + x] = u8(f64ToInt(value))
+                }
+            }
+        }
+    }
+    QrImage(width, height, pixels)
+}
+
+fun testRotate(image: QrImage, degrees: f64): QrImage {
+    val angle = degrees * mathPi / 180.0
+    val cosine = cos(angle)
+    val sine = sin(angle)
+    val side = image.width + image.width / 2
+    val center = f64FromInt(side) / 2.0
+    val middle = f64FromInt(image.width) / 2.0
+    testWarp(image, side, side, 255, { x: f64, y: f64 ->
+        val dx = x - center
+        val dy = y - center
+        [middle + dx * cosine + dy * sine, middle - dx * sine + dy * cosine]
+    })
+}
+
+fun testPerspective(image: QrImage, amount: f64): QrImage {
+    val side = image.width + image.width / 2
+    val center = f64FromInt(side) / 2.0
+    val middle = f64FromInt(image.width) / 2.0
+    testWarp(image, side, side, 255, { x: f64, y: f64 ->
+        val dx = x - center
+        val dy = y - center
+        val w = 1.0 + amount * dx / center + amount * 0.5 * dy / center
+        [middle + dx / w, middle + dy / w]
+    })
+}

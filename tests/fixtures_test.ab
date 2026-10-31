@@ -1,0 +1,23 @@
+// Reads the fixtures committed under tests/fixtures/photo-style. They are
+// synthesized by tools/make_fixtures.py, not photographs: codes from other
+// encoders put through imitations of what a camera does.
+
+import "abla/test"
+import "abla/text"
+import "abla/crypto"
+import "abla/fs"
+import "../src/qr.ab"
+
+fun main: int {
+    val folder = "tests/fixtures/photo-style/"
+    val lines = Path(folder + "manifest.tsv").readText().trim().split("\n")
+    expect(lines.size >= 10, "fixture count")
+    for (line in lines) {
+        val fields = line.split("\t")
+        val result = qrReadPng(Path(folder + fields[0]).readText())
+        val decoded = result.decoded
+        if (decoded != null) expectEqual(hexEncode(decoded.data), fields[2], fields[0])
+        else expect(false, "${fields[0]}: ${result.error}")
+    }
+    testsPassed()
+}

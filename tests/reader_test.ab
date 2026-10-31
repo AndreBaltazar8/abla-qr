@@ -1,0 +1,205 @@
+import "abla/test"
+import "abla/float"
+import "abla/bytes"
+import "abla/math"
+import "support.ab"
+import "../src/qr.ab"
+
+private val payload = "https://example.com/reader?test=1"
+
+private fun readText(image: QrImage): string {
+    val result = qrRead(image)
+    val decoded = result.decoded
+    if (decoded == null) return "failed: ${result.error}"
+    decoded.data
+}
+
+private fun scene(text: string, options: QrOptions, scale: int, border: int): QrImage {
+    val matrix = qrEncode(text, options).matrix
+    if (matrix == null) return QrImage(1, 1, filledArray(1, u8(255)))
+    testImage(matrix, scale, border)
+}
+
+// One image with a code drawn in, on a canvas.
+private fun blit(var target: QrImage, source: QrImage, left: int, top: int): void {
+    for (y in 0 until source.height)
+        for (x in 0 until source.width)
+            target.pixels[(y + top) * target.width + x + left] = source.pixels[y * source.width + x]
+    return
+}
+
+fun main: int {
+    val plain = QrOptions()
+
+    // Clean codes, every twelfth version and each level.
+    var version = 1
+    while (version <= 40) {
+        for (level in 0..3) {
+            val text = "v$version L$level"
+            val image = scene(text, QrOptions(errorCorrection = QrErrorCorrection(level), minVersion = version, maxVersion = version), 3, 4)
+            expectEqual(readText(image), text, "clean v$version level $level")
+        }
+        version += if (version == 1) 6 else 11
+    }
+
+    // The right angles.
+    val base = scene(payload, plain, 6, 4)
+    for (degrees in [0.0, 90.0, 180.0, 270.0]) expectEqual(readText(testRotate(base, degrees)), payload, "rotated by quarter turns")
+    // Any angle.
+    var angle = 5.0
+    while (angle < 360.0) {
+        expectEqual(readText(testRotate(base, angle)), payload, "rotated")
+        angle += 25.0
+    }
+    // Perspective both ways.
+    for (amount in [-0.3, -0.2, -0.1, 0.1, 0.2, 0.3]) expectEqual(readText(testPerspective(base, amount)), payload, "perspective")
+
+    // A skew, keeping the transform's corner reachable.
+    val skewed = testWarp(base, base.width * 2, base.height * 2, 255, { x: f64, y: f64 -> [x - y * 0.35, y] })
+    expectEqual(readText(skewed), payload, "skewed")
+
+    // Version 1 has no alignment pattern to help.
+    val first = scene("V1", QrOptions(minVersion = 1, maxVersion = 1), 8, 4)
+    for (amount in [-0.2, 0.2]) expectEqual(readText(testPerspective(first, amount)), "V1", "version 1 perspective")
+
+    // Upside-down light: dark background, light modules.
+    val negative = filledArray(base.pixels.size, u8(0))
+    for (index in 0 until negative.size) negative[index] = u8(255 - int(base.pixels[index]))
+    expectEqual(readText(QrImage(base.width, base.height, negative)), payload, "inverted")
+
+    // A mirror image, as through a window.
+    val mirror = filledArray(base.pixels.size, u8(0))
+    for (y in 0 until base.height)
+        for (x in 0 until base.width)
+            mirror[y * base.width + x] = base.pixels[y * base.width + base.width - 1 - x]
+    val mirrored = qrRead(QrImage(base.width, base.height, mirror)).decoded
+    if (mirrored != null) {
+        expectEqual(mirrored.data, payload, "mirrored data")
+        expect(mirrored.mirrored, "mirrored flag")
+    } else expect(false, "mirrored reads")
+
+    // Low contrast: gray on gray.
+    val dull = filledArray(base.pixels.size, u8(0))
+    for (index in 0 until dull.size) dull[index] = u8(120 + int(base.pixels[index]) / 16)
+    expectEqual(readText(QrImage(base.width, base.height, dull)), payload, "low contrast")
+
+    // Light falling off across the image defeats any global threshold.
+    val shaded = filledArray(base.pixels.size, u8(0))
+    for (y in 0 until base.height) {
+        for (x in 0 until base.width) {
+            val light = 30 + 225 * (x + y) / (base.width + base.height)
+            shaded[y * base.width + x] = u8(int(base.pixels[y * base.width + x]) * light / 255 + light / 4)
+        }
+    }
+    expectEqual(readText(QrImage(base.width, base.height, shaded)), payload, "shadow")
+
+    // Salt and pepper noise.
+    val random = TestRandom(2026)
+    val noisy = filledArray(base.pixels.size, u8(0))
+    for (index in 0 until noisy.size)
+        noisy[index] = if (random.next(100) < 6) u8(random.next(256)) else base.pixels[index]
+    expectEqual(readText(QrImage(base.width, base.height, noisy)), payload, "noise")
+
+    // Damage to data modules at level H: a block over the code's middle.
+    val tough = scene(payload, QrOptions(errorCorrection = qrEcHigh), 6, 4)
+    val patched = filledArray(tough.pixels.size, u8(0))
+    for (index in 0 until patched.size) patched[index] = tough.pixels[index]
+    val quarter = tough.width / 2
+    for (y in quarter - tough.width / 10 until quarter + tough.width / 10)
+        for (x in quarter - tough.width / 10 until quarter + tough.width / 10)
+            patched[y * tough.width + x] = u8(255)
+    val repaired = qrRead(QrImage(tough.width, tough.height, patched)).decoded
+    if (repaired != null) {
+        expectEqual(repaired.data, payload, "centre patch")
+        expect(repaired.correctedErrors > 0, "centre patch was repaired")
+    } else expect(false, "centre patch reads")
+    // A corner clipped off a finder still reads.
+    val clipped = filledArray(tough.pixels.size, u8(0))
+    for (index in 0 until clipped.size) clipped[index] = tough.pixels[index]
+    for (y in 24 until 30) for (x in 24 until 30) clipped[y * tough.width + x] = u8(255)
+    expectEqual(readText(QrImage(tough.width, tough.height, clipped)), payload, "finder corner clipped")
+
+    // A curved code, bowed two modules: enough that one transform can't cover it.
+    val big = scene("A".repeat(600), QrOptions(minVersion = 15, maxVersion = 15), 4, 4)
+    val center = f64FromInt(big.width) / 2.0
+    val bent = testWarp(big, big.width + 40, big.height + 40, 255, { x: f64, y: f64 ->
+        val dx = (x - 20.0 - center) / center
+        [x - 20.0, y - 20.0 + 8.0 * dx * dx]
+    })
+    expectEqual(readText(bent), "A".repeat(600), "bent")
+
+    // Where it says the code is.
+    val located = qrRead(base)
+    if (located.succeeded) {
+        expectEqual(located.corners.size, 4, "four corners")
+        expect(fabs(located.corners[0].x - 24.0) < 2.0 && fabs(located.corners[0].y - 24.0) < 2.0, "top left corner")
+        val far = f64FromInt(base.width) - 24.0
+        expect(fabs(located.corners[1].x - far) < 2.0 && fabs(located.corners[1].y - 24.0) < 2.0, "top right corner")
+        expect(fabs(located.corners[2].x - far) < 2.0 && fabs(located.corners[2].y - far) < 2.0, "bottom right corner")
+    } else expect(false, "located reads")
+    val turned = qrRead(testRotate(base, 180.0))
+    if (turned.succeeded) expect(turned.corners[0].x > turned.corners[2].x, "corners follow the code's own orientation")
+
+    // Several codes at once.
+    val a = scene("first code", plain, 4, 2)
+    val b = scene("second code", plain, 5, 2)
+    val c = scene("third code", QrOptions(errorCorrection = qrEcHigh), 3, 2)
+    val canvas = QrImage(600, 500, filledArray(300000, u8(255)))
+    blit(canvas, a, 20, 20)
+    blit(canvas, b, 300, 40)
+    blit(canvas, c, 100, 300)
+    val all = qrReadAll(canvas)
+    expectEqual(all.size, 3, "three codes found")
+    var seen = 0
+    for (result in all) {
+        val decoded = result.decoded
+        if (decoded != null) {
+            if (decoded.data == "first code") seen += 1
+            if (decoded.data == "second code") seen += 2
+            if (decoded.data == "third code") seen += 4
+        }
+    }
+    expectEqual(seen, 7, "each code once")
+    expectEqual(readText(canvas).size > 0, true, "one read takes any of them")
+
+    // PNG all the way through.
+    val matrix = qrEncode(payload).matrix
+    if (matrix != null) {
+        val read = qrReadPng(qrPng(matrix))
+        expect(read.succeeded, "reads a PNG")
+    } else expect(false, "encodes")
+    expectEqual(qrReadPng("nonsense").error, "not_png", "PNG errors pass through")
+
+    // Nothing there.
+    expectEqual(qrRead(QrImage(200, 200, filledArray(40000, u8(255)))).error, "not_found", "blank white")
+    expectEqual(qrRead(QrImage(200, 200, filledArray(40000, u8(0)))).error, "not_found", "blank black")
+    expectEqual(qrRead(QrImage(1, 1, filledArray(1, u8(0)))).error, "not_found", "one pixel")
+    expectEqual(qrRead(QrImage(3, 500, filledArray(1500, u8(9)))).error, "not_found", "thin")
+    expect(qrReadAll(QrImage(50, 50, filledArray(2500, u8(0)))).size == 0, "read all finds nothing")
+
+    // Finder patterns alone: located, but nothing to read.
+    val decoy = scene(payload, plain, 6, 4)
+    val blanked = filledArray(decoy.pixels.size, u8(0))
+    for (index in 0 until blanked.size) blanked[index] = decoy.pixels[index]
+    val side = decoy.width
+    for (y in 24 + 9 * 6 until side - 24)
+        for (x in 24 + 9 * 6 until side - 24)
+            blanked[y * side + x] = u8(if ((x + y) / 6 % 2 == 0) 255 else 0)
+    expectEqual(qrRead(QrImage(side, side, blanked)).error, "undecodable", "finders without data")
+
+    // Noise images never panic.
+    for (trial in 0 until 40) {
+        val width = 20 + random.next(200)
+        val height = 20 + random.next(200)
+        val pixels = filledArray(width * height, u8(0))
+        val granularity = 1 + random.next(6)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                pixels[y * width + x] = if ((x / granularity + y / granularity * 7) % 2 == random.next(2)) u8(255) else u8(0)
+            }
+        }
+        qrRead(QrImage(width, height, pixels))
+    }
+    expect(true, "noise images")
+    testsPassed()
+}

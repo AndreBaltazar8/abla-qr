@@ -1,0 +1,956 @@
+// Finds QR codes in a grayscale image and reads them.
+//
+// The image is binarized, finder patterns are found by their 1:1:3:1:1 runs,
+// and each plausible triple gives a perspective transform. The transform is
+// refined against the known function patterns before modules are sampled, and
+// on curved codes corrected locally from the alignment patterns.
+
+import "abla/float"
+import "abla/math"
+import "abla/text"
+import "tables.ab"
+import "matrix.ab"
+import "image.ab"
+import "png.ab"
+import "decode.ab"
+
+class QrPoint(val x: f64, val y: f64)
+
+class QrReadResult(
+    val succeeded: bool,
+    // "not_found" when no finder patterns line up, "undecodable" when a code
+    // was located but its data couldn't be recovered.
+    val error: string,
+    val decoded: QrDecoded?,
+    // The code's outer corners in the image: top left, top right, bottom
+    // right, bottom left of the code as it reads.
+    val corners: array<QrPoint>
+)
+
+private class Finder(var x: f64, var y: f64, var moduleSize: f64, var hits: int)
+
+private class Transform(
+    val a: f64, val b: f64, val c: f64,
+    val d: f64, val e: f64, val f: f64,
+    val g: f64, val h: f64
+) {
+    fun x(u: f64, v: f64): f64 = (this.a * u + this.b * v + this.c) / (this.g * u + this.h * v + 1.0)
+    fun y(u: f64, v: f64): f64 = (this.d * u + this.e * v + this.f) / (this.g * u + this.h * v + 1.0)
+}
+
+private class Bitmap(val width: int, val height: int, val dark: array<u8>) {
+    fun at(x: f64, y: f64): bool {
+        if (!(x >= 0.0 && y >= 0.0)) return false
+        val column = f64ToInt(x)
+        val row = f64ToInt(y)
+        if (column >= this.width || row >= this.height) return false
+        this.dark[row * this.width + column] == u8(1)
+    }
+}
+
+// ------------------------------------------------------------------ binarize
+
+private fun otsuThreshold(image: QrImage): int {
+    val histogram = filledArray(256, 0)
+    for (pixel in image.pixels) {
+        val value = int(pixel)
+        histogram[value] += 1
+    }
+    var sum = 0
+    for (value in 0 until 256) sum += value * histogram[value]
+    var below = 0
+    var sumBelow = 0
+    var best = -1.0
+    var threshold = 127
+    val total = image.pixels.size
+    for (value in 0 until 256) {
+        below += histogram[value]
+        sumBelow += value * histogram[value]
+        val above = total - below
+        if (below > 0 && above > 0) {
+            val difference = f64FromInt(sumBelow) / f64FromInt(below) - f64FromInt(sum - sumBelow) / f64FromInt(above)
+            val score = f64FromInt(below) * f64FromInt(above) * difference * difference
+            if (score > best) {
+                best = score
+                threshold = value
+            }
+        }
+    }
+    threshold
+}
+
+private fun binarizeGlobal(image: QrImage): Bitmap {
+    val threshold = otsuThreshold(image)
+    val dark = filledArray(image.pixels.size, u8(0))
+    for (index in 0 until dark.size)
+        if (int(image.pixels[index]) <= threshold) dark[index] = u8(1)
+    Bitmap(image.width, image.height, dark)
+}
+
+// A summed-area table with one extra row and column of zeros.
+private fun integral(image: QrImage): array<int> {
+    val stride = image.width + 1
+    val table = filledArray(stride * (image.height + 1), 0)
+    for (y in 0 until image.height) {
+        var row = 0
+        for (x in 0 until image.width) {
+            row += int(image.pixels[y * image.width + x])
+            table[(y + 1) * stride + x + 1] = table[y * stride + x + 1] + row
+        }
+    }
+    table
+}
+
+// Dark where a pixel is well below the mean around it, which rides out shadows
+// and uneven light.
+private fun binarizeLocal(image: QrImage, radius: int, table: array<int>): Bitmap {
+    val width = image.width
+    val height = image.height
+    val stride = width + 1
+    val dark = filledArray(image.pixels.size, u8(0))
+    for (y in 0 until height) {
+        val top = if (y - radius < 0) 0 else y - radius
+        val bottom = if (y + radius + 1 > height) height else y + radius + 1
+        for (x in 0 until width) {
+            val left = if (x - radius < 0) 0 else x - radius
+            val right = if (x + radius + 1 > width) width else x + radius + 1
+            val sum = table[bottom * stride + right] - table[top * stride + right] -
+                table[bottom * stride + left] + table[top * stride + left]
+            val count = (bottom - top) * (right - left)
+            if (int(image.pixels[y * width + x]) * count * 100 < sum * 92) dark[y * width + x] = u8(1)
+        }
+    }
+    Bitmap(width, height, dark)
+}
+
+private fun boxBlur(image: QrImage, radius: int): QrImage {
+    val table = integral(image)
+    val width = image.width
+    val height = image.height
+    val stride = width + 1
+    val pixels = filledArray(image.pixels.size, u8(0))
+    for (y in 0 until height) {
+        val top = if (y - radius < 0) 0 else y - radius
+        val bottom = if (y + radius + 1 > height) height else y + radius + 1
+        for (x in 0 until width) {
+            val left = if (x - radius < 0) 0 else x - radius
+            val right = if (x + radius + 1 > width) width else x + radius + 1
+            val sum = table[bottom * stride + right] - table[top * stride + right] -
+                table[bottom * stride + left] + table[top * stride + left]
+            pixels[y * width + x] = u8(sum / ((bottom - top) * (right - left)))
+        }
+    }
+    QrImage(width, height, pixels)
+}
+
+private fun inverted(bitmap: Bitmap): Bitmap {
+    val dark = filledArray(bitmap.dark.size, u8(0))
+    for (index in 0 until dark.size) if (bitmap.dark[index] == u8(0)) dark[index] = u8(1)
+    Bitmap(bitmap.width, bitmap.height, dark)
+}
+
+// ------------------------------------------------------------------- finders
+
+private fun runFits(run: int, modules: int, total: int): bool {
+    val difference = run * 7 - modules * total
+    val distance = if (difference < 0) -difference else difference
+    distance * 10 < total * (if (modules == 3) 18 else 7)
+}
+
+private fun ratioFits(a: int, b: int, c: int, d: int, e: int): bool {
+    val total = a + b + c + d + e
+    total >= 7 && runFits(a, 1, total) && runFits(b, 1, total) && runFits(c, 3, total) &&
+        runFits(d, 1, total) && runFits(e, 1, total)
+}
+
+private class CrossCheck(val center: f64, val total: int)
+
+// Walks both ways along a line from a point in the stone. The returned centre is
+// the stone's along the line, measured from the start point.
+private fun crossCheck(bitmap: Bitmap, startX: int, startY: int, stepX: int, stepY: int, limit: int): CrossCheck? {
+    val width = bitmap.width
+    val height = bitmap.height
+    val runs = filledArray(5, 0)
+    var x = startX
+    var y = startY
+    if (bitmap.dark[y * width + x] != u8(1)) return null
+    // Stone towards the start of the line, then gap and ring.
+    var distance = 0
+    while (x >= 0 && y >= 0 && x < width && y < height && bitmap.dark[y * width + x] == u8(1)) {
+        runs[2] += 1
+        x -= stepX
+        y -= stepY
+        distance += 1
+        if (distance > limit) return null
+    }
+    val stoneBack = distance
+    var index = 1
+    while (index >= 0) {
+        val wanted = if (index == 1) u8(0) else u8(1)
+        while (x >= 0 && y >= 0 && x < width && y < height && bitmap.dark[y * width + x] == wanted) {
+            if (index == 1) runs[1] += 1 else runs[0] += 1
+            x -= stepX
+            y -= stepY
+            if (runs[1] + runs[0] > limit) return null
+        }
+        index -= 1
+    }
+    x = startX + stepX
+    y = startY + stepY
+    distance = 1
+    while (x >= 0 && y >= 0 && x < width && y < height && bitmap.dark[y * width + x] == u8(1)) {
+        runs[2] += 1
+        x += stepX
+        y += stepY
+        distance += 1
+        if (distance > limit) return null
+    }
+    val stoneForward = distance
+    index = 3
+    while (index <= 4) {
+        val wanted = if (index == 3) u8(0) else u8(1)
+        while (x >= 0 && y >= 0 && x < width && y < height && bitmap.dark[y * width + x] == wanted) {
+            if (index == 3) runs[3] += 1 else runs[4] += 1
+            x += stepX
+            y += stepY
+            if (runs[3] + runs[4] > limit) return null
+        }
+        index += 1
+    }
+    if (!ratioFits(runs[0], runs[1], runs[2], runs[3], runs[4])) return null
+    CrossCheck(f64FromInt(stoneForward - stoneBack) / 2.0, runs[0] + runs[1] + runs[2] + runs[3] + runs[4])
+}
+
+private fun addFinder(var finders: array<Finder>, x: f64, y: f64, moduleSize: f64): void {
+    for (finder in finders) {
+        val reach = fmax(finder.moduleSize, moduleSize) * 2.0
+        val ratio = moduleSize / finder.moduleSize
+        if (fabs(finder.x - x) <= reach && fabs(finder.y - y) <= reach && ratio > 0.4 && ratio < 2.5) {
+            val weight = f64FromInt(finder.hits)
+            finder.x = (finder.x * weight + x) / (weight + 1.0)
+            finder.y = (finder.y * weight + y) / (weight + 1.0)
+            finder.moduleSize = (finder.moduleSize * weight + moduleSize) / (weight + 1.0)
+            finder.hits += 1
+            return
+        }
+    }
+    finders.append(Finder(x, y, moduleSize, 1))
+    return
+}
+
+private fun findFinders(bitmap: Bitmap): array<Finder> {
+    val width = bitmap.width
+    val height = bitmap.height
+    val finders: array<Finder> = []
+    val starts: array<int> = []
+    for (y in 0 until height) {
+        starts.truncate(0)
+        val row = y * width
+        var previous = u8(0)
+        for (x in 0 until width) {
+            val value = bitmap.dark[row + x]
+            if (value != previous) {
+                starts.append(x)
+                previous = value
+            }
+        }
+        // starts[even] opens a dark run, starts[odd] closes it.
+        if (previous == u8(1)) starts.append(width)
+        var index = 0
+        while (index + 5 < starts.size) {
+            val a = starts[index + 1] - starts[index]
+            val b = starts[index + 2] - starts[index + 1]
+            val c = starts[index + 3] - starts[index + 2]
+            val d = starts[index + 4] - starts[index + 3]
+            val e = starts[index + 5] - starts[index + 4]
+            if (ratioFits(a, b, c, d, e)) {
+                val total = a + b + c + d + e
+                val middle = starts[index + 2] + c / 2
+                val across = crossCheck(bitmap, middle, y, 0, 1, total * 3)
+                if (across != null) {
+                    val centerY = y + f64ToInt(floor(across.center + 0.5))
+                    if (centerY >= 0 && centerY < height) {
+                        val along = crossCheck(bitmap, middle, centerY, 1, 0, total * 3)
+                        if (along != null) {
+                            val moduleSize = f64FromInt(total + along.total + across.total) / 21.0
+                            addFinder(finders, f64FromInt(middle) + along.center + 0.5, f64FromInt(centerY) + 0.5, moduleSize)
+                        }
+                    }
+                }
+            }
+            index += 2
+        }
+    }
+    finders
+}
+
+// ------------------------------------------------------------------ geometry
+
+private fun solveTransform(sources: array<f64>, targets: array<f64>): Transform? {
+    // Gaussian elimination on the eight unknowns of a homography, in rows of nine.
+    val rows: array<f64> = []
+    for (point in 0 until 4) {
+        val u = sources[point * 2]
+        val v = sources[point * 2 + 1]
+        val x = targets[point * 2]
+        val y = targets[point * 2 + 1]
+        for (value in [u, v, 1.0, 0.0, 0.0, 0.0, -u * x, -v * x, x]) rows.append(value)
+        for (value in [0.0, 0.0, 0.0, u, v, 1.0, -u * y, -v * y, y]) rows.append(value)
+    }
+    for (column in 0 until 8) {
+        var pivot = column
+        for (row in column + 1 until 8)
+            if (fabs(rows[row * 9 + column]) > fabs(rows[pivot * 9 + column])) pivot = row
+        if (fabs(rows[pivot * 9 + column]) < 1e-9) return null
+        if (pivot != column) {
+            for (cell in 0 until 9) {
+                val held = rows[pivot * 9 + cell]
+                rows[pivot * 9 + cell] = rows[column * 9 + cell]
+                rows[column * 9 + cell] = held
+            }
+        }
+        for (row in 0 until 8) {
+            if (row != column) {
+                val factor = rows[row * 9 + column] / rows[column * 9 + column]
+                if (factor != 0.0)
+                    for (cell in column until 9) rows[row * 9 + cell] = rows[row * 9 + cell] - factor * rows[column * 9 + cell]
+            }
+        }
+    }
+    val solution = filledArray(8, 0.0)
+    for (index in 0 until 8) solution[index] = rows[index * 9 + 8] / rows[index * 9 + index]
+    Transform(solution[0], solution[1], solution[2], solution[3], solution[4], solution[5], solution[6], solution[7])
+}
+
+// The modules whose colour is known in advance: finders with their separators,
+// timing and alignment patterns.
+private class Template(val us: array<f64>, val vs: array<f64>, val dark: array<bool>)
+
+private fun buildTemplate(version: int): Template {
+    val layout = qrLayout(version)
+    val size = layout.size
+    val us: array<f64> = []
+    val vs: array<f64> = []
+    val dark: array<bool> = []
+    for (y in 0 until size) {
+        for (x in 0 until size) {
+            val format = (x == 8 && (y <= 8 || y >= size - 8)) || (y == 8 && (x <= 8 || x >= size - 8))
+            val versionArea = version >= 7 &&
+                ((x >= size - 11 && x < size - 8 && y < 6) || (y >= size - 11 && y < size - 8 && x < 6))
+            if (layout.reserved[y * size + x] && !format && !versionArea) {
+                us.append(f64FromInt(x) + 0.5)
+                vs.append(f64FromInt(y) + 0.5)
+                dark.append(layout.dark[y * size + x])
+            }
+        }
+    }
+    Template(us, vs, dark)
+}
+
+private fun emptyTemplates(): array<Template?> {
+    val result: array<Template?> = []
+    for (index in 0..40) result.append(null)
+    result
+}
+
+private val templates = emptyTemplates()
+
+private fun templateFor(version: int): Template {
+    val cached = templates[version]
+    if (cached != null) return cached
+    val built = buildTemplate(version)
+    templates[version] = built
+    built
+}
+
+private fun templateScore(bitmap: Bitmap, template: Template, transform: Transform): int {
+    var matches = 0
+    for (index in 0 until template.us.size) {
+        val u = template.us[index]
+        val v = template.vs[index]
+        if (bitmap.at(transform.x(u, v), transform.y(u, v)) == template.dark[index]) matches += 1
+    }
+    matches
+}
+
+// Climbs on the four image points until the known modules fit best, which
+// settles the perspective a three-finder guess can't see.
+private fun refine(bitmap: Bitmap, template: Template, sources: array<f64>, var targets: array<f64>, moduleSize: f64): void {
+    val start = solveTransform(sources, targets)
+    if (start == null) return
+    var bestScore = templateScore(bitmap, template, start)
+    var step = moduleSize
+    for (pass in 0 until 6) {
+        for (coordinate in 0 until 8) {
+            for (direction in 0..1) {
+                val original = targets[coordinate]
+                targets[coordinate] = original + (if (direction == 0) step else -step)
+                val trial = solveTransform(sources, targets)
+                var score = -1
+                if (trial != null) score = templateScore(bitmap, template, trial)
+                if (score > bestScore) bestScore = score
+                else targets[coordinate] = original
+            }
+        }
+        step = step * 0.6
+    }
+    return
+}
+
+// How well the 5x5 alignment pattern fits at a point, out of 25.
+private fun alignmentFit(bitmap: Bitmap, x: f64, y: f64, ux: f64, uy: f64, vx: f64, vy: f64): int {
+    var matches = 0
+    for (dy in -2..2) {
+        for (dx in -2..2) {
+            val ring = if (dx * dx > dy * dy) dx * dx else dy * dy
+            val px = x + f64FromInt(dx) * ux + f64FromInt(dy) * vx
+            val py = y + f64FromInt(dx) * uy + f64FromInt(dy) * vy
+            if (bitmap.at(px, py) == (ring != 1)) matches += 1
+        }
+    }
+    matches
+}
+
+private class Located(val x: f64, val y: f64, val score: int)
+
+private fun searchAlignment(bitmap: Bitmap, cx: f64, cy: f64, ux: f64, uy: f64, vx: f64, vy: f64, radius: f64, stride: f64): Located {
+    var bestX = cx
+    var bestY = cy
+    var bestScore = -1
+    var bestDistance = 0.0
+    val scales: array<f64> = [1.0, 0.85, 1.15]
+    var oy = -radius
+    while (oy <= radius) {
+        var ox = -radius
+        while (ox <= radius) {
+            for (scale in scales) {
+                val score = alignmentFit(bitmap, cx + ox, cy + oy, ux * scale, uy * scale, vx * scale, vy * scale)
+                val distance = ox * ox + oy * oy
+                if (score > bestScore || (score == bestScore && distance < bestDistance)) {
+                    bestScore = score
+                    bestX = cx + ox
+                    bestY = cy + oy
+                    bestDistance = distance
+                }
+            }
+            ox += stride
+        }
+        oy += stride
+    }
+    Located(bestX, bestY, bestScore)
+}
+
+// Length of 3.5 modules: walking from a finder centre, stone, gap, ring.
+private fun walkModule(bitmap: Bitmap, fromX: f64, fromY: f64, towardsX: f64, towardsY: f64): f64 {
+    val length = hypot(towardsX - fromX, towardsY - fromY)
+    if (length < 1.0) return -1.0
+    val stepX = (towardsX - fromX) / length
+    val stepY = (towardsY - fromY) / length
+    var transitions = 0
+    var current = true
+    var walked = 0.0
+    while (walked < length) {
+        val value = bitmap.at(fromX + stepX * walked, fromY + stepY * walked)
+        if (value != current) {
+            transitions += 1
+            current = value
+            if (transitions == 3) return walked / 3.5
+        }
+        walked += 0.5
+    }
+    -1.0
+}
+
+// An outer edge of a finder: the line through where its ring ends, walking
+// along `out` from points spread along `side`.
+private class EdgeLine(val x: f64, val y: f64, val dx: f64, val dy: f64)
+
+private fun finderEdge(bitmap: Bitmap, finder: Finder, outX: f64, outY: f64, sideX: f64, sideY: f64, moduleSize: f64): EdgeLine? {
+    val xs: array<f64> = []
+    val ys: array<f64> = []
+    var offset = -2.75
+    while (offset <= 2.76) {
+        val startX = finder.x + sideX * offset * moduleSize
+        val startY = finder.y + sideY * offset * moduleSize
+        var last = -1.0
+        var walked = 2.0 * moduleSize
+        val limit = 5.0 * moduleSize
+        while (walked < limit) {
+            if (bitmap.at(startX + outX * walked, startY + outY * walked)) last = walked
+            walked += 0.25
+        }
+        if (last > 0.0) {
+            xs.append(startX + outX * (last + 0.25))
+            ys.append(startY + outY * (last + 0.25))
+        }
+        offset += 0.5
+    }
+    if (xs.size < 5) return null
+    var meanX = 0.0
+    var meanY = 0.0
+    for (index in 0 until xs.size) {
+        meanX += xs[index]
+        meanY += ys[index]
+    }
+    meanX = meanX / f64FromInt(xs.size)
+    meanY = meanY / f64FromInt(xs.size)
+    // The principal axis of the points.
+    var xx = 0.0
+    var yy = 0.0
+    var xy = 0.0
+    for (index in 0 until xs.size) {
+        val dx = xs[index] - meanX
+        val dy = ys[index] - meanY
+        xx += dx * dx
+        yy += dy * dy
+        xy += dx * dy
+    }
+    val angle = atan2(2.0 * xy, xx - yy) / 2.0
+    EdgeLine(meanX, meanY, cos(angle), sin(angle))
+}
+
+// The code's far corner: where the outer edges of the other two finders meet.
+private fun farCorner(bitmap: Bitmap, tl: Finder, tr: Finder, bl: Finder, moduleSize: f64): array<f64> {
+    val acrossX = tr.x - tl.x
+    val acrossY = tr.y - tl.y
+    val downX = bl.x - tl.x
+    val downY = bl.y - tl.y
+    val acrossLength = hypot(acrossX, acrossY)
+    val downLength = hypot(downX, downY)
+    val ux = acrossX / acrossLength
+    val uy = acrossY / acrossLength
+    val vx = downX / downLength
+    val vy = downY / downLength
+    val right = finderEdge(bitmap, tr, ux, uy, vx, vy, tr.moduleSize)
+    val bottom = finderEdge(bitmap, bl, vx, vy, ux, uy, bl.moduleSize)
+    if (right == null || bottom == null) return array<f64>()
+    val denominator = right.dx * bottom.dy - right.dy * bottom.dx
+    if (fabs(denominator) < 0.05) return array<f64>()
+    val along = ((bottom.x - right.x) * bottom.dy - (bottom.y - right.y) * bottom.dx) / denominator
+    val x = right.x + right.dx * along
+    val y = right.y + right.dy * along
+    // Sane only near where a parallelogram would put it.
+    val guessX = tr.x + bl.x - tl.x
+    val guessY = tr.y + bl.y - tl.y
+    if (hypot(x - guessX, y - guessY) > (acrossLength + downLength) / 2.0) return array<f64>()
+    [x, y]
+}
+
+private fun moduleAlong(bitmap: Bitmap, a: Finder, b: Finder): f64 {
+    val forward = walkModule(bitmap, a.x, a.y, b.x, b.y)
+    val backward = walkModule(bitmap, b.x, b.y, a.x, a.y)
+    if (forward > 0.0 && backward > 0.0) return (forward + backward) / 2.0
+    if (forward > 0.0) return forward
+    if (backward > 0.0) return backward
+    (a.moduleSize + b.moduleSize) / 2.0
+}
+
+// ------------------------------------------------------------------ sampling
+
+private class Warp(val positions: array<f64>, val dx: array<f64>, val dy: array<f64>)
+
+private fun warpAt(warp: Warp, u: f64, v: f64, wantY: bool): f64 {
+    val positions = warp.positions
+    val count = positions.size
+    var column = 0
+    while (column + 2 < count && u > positions[column + 1]) column += 1
+    var row = 0
+    while (row + 2 < count && v > positions[row + 1]) row += 1
+    // Past the outer patterns the correction carries on along its last slope.
+    val s = fclamp((u - positions[column]) / (positions[column + 1] - positions[column]), -0.6, 1.6)
+    val t = fclamp((v - positions[row]) / (positions[row + 1] - positions[row]), -0.6, 1.6)
+    val grid = if (wantY) warp.dy else warp.dx
+    val top = grid[row * count + column] * (1.0 - s) + grid[row * count + column + 1] * s
+    val bottom = grid[(row + 1) * count + column] * (1.0 - s) + grid[(row + 1) * count + column + 1] * s
+    top * (1.0 - t) + bottom * t
+}
+
+private fun sampleModules(bitmap: Bitmap, transform: Transform, size: int, warp: Warp?): QrMatrix {
+    val modules = filledArray(size * size, false)
+    val offsets: array<f64> = [0.0, 0.0, -0.22, -0.22, 0.22, -0.22, -0.22, 0.22, 0.22, 0.22]
+    for (y in 0 until size) {
+        for (x in 0 until size) {
+            var votes = 0
+            for (point in 0 until 5) {
+                val u = f64FromInt(x) + 0.5 + offsets[point * 2]
+                val v = f64FromInt(y) + 0.5 + offsets[point * 2 + 1]
+                var px = transform.x(u, v)
+                var py = transform.y(u, v)
+                if (warp != null) {
+                    px += warpAt(warp, u, v, false)
+                    py += warpAt(warp, u, v, true)
+                }
+                if (bitmap.at(px, py)) votes += 1
+            }
+            modules[y * size + x] = votes >= 3
+        }
+    }
+    qrMatrixFromModules(size, modules)
+}
+
+private fun bilinear(image: QrImage, x: f64, y: f64): f64 {
+    val fx = x - 0.5
+    val fy = y - 0.5
+    if (!(fx >= 0.0 && fy >= 0.0)) return 255.0
+    val left = f64ToInt(fx)
+    val top = f64ToInt(fy)
+    if (left + 1 >= image.width || top + 1 >= image.height) return 255.0
+    val s = fx - f64FromInt(left)
+    val t = fy - f64FromInt(top)
+    val at = top * image.width + left
+    val upper = f64FromInt(int(image.pixels[at])) * (1.0 - s) + f64FromInt(int(image.pixels[at + 1])) * s
+    val lower = f64FromInt(int(image.pixels[at + image.width])) * (1.0 - s) + f64FromInt(int(image.pixels[at + image.width + 1])) * s
+    upper * (1.0 - t) + lower * t
+}
+
+// Modules read from gray values against the mean of the modules around them,
+// for codes too small or too blurred to survive binarizing first.
+private fun sampleGray(image: QrImage, transform: Transform, size: int, warp: Warp?, invert: bool): QrMatrix {
+    val values = filledArray(size * size, 0.0)
+    for (y in 0 until size) {
+        for (x in 0 until size) {
+            val u = f64FromInt(x) + 0.5
+            val v = f64FromInt(y) + 0.5
+            var px = transform.x(u, v)
+            var py = transform.y(u, v)
+            if (warp != null) {
+                px += warpAt(warp, u, v, false)
+                py += warpAt(warp, u, v, true)
+            }
+            values[y * size + x] = bilinear(image, px, py)
+        }
+    }
+    val modules = filledArray(size * size, false)
+    val radius = 5
+    for (y in 0 until size) {
+        for (x in 0 until size) {
+            var sum = 0.0
+            var count = 0
+            for (ny in max(0, y - radius)..min(size - 1, y + radius)) {
+                for (nx in max(0, x - radius)..min(size - 1, x + radius)) {
+                    sum += values[ny * size + nx]
+                    count += 1
+                }
+            }
+            val darker = values[y * size + x] < sum / f64FromInt(count)
+            modules[y * size + x] = darker != invert
+        }
+    }
+    qrMatrixFromModules(size, modules)
+}
+
+// Where the alignment patterns really are against where the transform puts
+// them. A bent code keeps its patterns near but not on their expected places.
+private fun buildWarp(bitmap: Bitmap, transform: Transform, version: int): Warp? {
+    val aligned = qrAlignmentPositions(version)
+    val count = aligned.size
+    if (count < 2) return null
+    val positions = filledArray(count, 0.0)
+    for (index in 0 until count) positions[index] = f64FromInt(aligned[index]) + 0.5
+    val dx = filledArray(count * count, 0.0)
+    val dy = filledArray(count * count, 0.0)
+    val known = filledArray(count * count, false)
+    for (row in 0 until count) {
+        for (column in 0 until count) {
+            val corner = (row == 0 && column == 0) || (row == 0 && column == count - 1) || (row == count - 1 && column == 0)
+            val u = positions[column]
+            val v = positions[row]
+            val x = transform.x(u, v)
+            val y = transform.y(u, v)
+            if (corner) {
+                known[row * count + column] = true
+            } else {
+                val ux = transform.x(u + 1.0, v) - x
+                val uy = transform.y(u + 1.0, v) - y
+                val vx = transform.x(u, v + 1.0) - x
+                val vy = transform.y(u, v + 1.0) - y
+                val moduleSize = hypot(ux, uy)
+                val stride = fmax(moduleSize / 4.0, 0.5)
+                val spot = searchAlignment(bitmap, x, y, ux, uy, vx, vy, moduleSize * 3.5, stride)
+                if (spot.score >= 21) {
+                    dx[row * count + column] = spot.x - x
+                    dy[row * count + column] = spot.y - y
+                    known[row * count + column] = true
+                }
+            }
+        }
+    }
+    // A damaged pattern takes the mean of the neighbours that were found.
+    for (row in 0 until count) {
+        for (column in 0 until count) {
+            if (!known[row * count + column]) {
+                var sumX = 0.0
+                var sumY = 0.0
+                var total = 0
+                for (nr in max(0, row - 1)..min(count - 1, row + 1)) {
+                    for (nc in max(0, column - 1)..min(count - 1, column + 1)) {
+                        if (known[nr * count + nc]) {
+                            sumX += dx[nr * count + nc]
+                            sumY += dy[nr * count + nc]
+                            total += 1
+                        }
+                    }
+                }
+                if (total > 0) {
+                    dx[row * count + column] = sumX / f64FromInt(total)
+                    dy[row * count + column] = sumY / f64FromInt(total)
+                }
+            }
+        }
+    }
+    Warp(positions, dx, dy)
+}
+
+// ------------------------------------------------------------------- locating
+
+private class Triple(val topLeft: int, val topRight: int, val bottomLeft: int, val score: f64)
+
+private fun makeTriple(finders: array<Finder>, i: int, j: int, k: int): Triple? {
+    val a = finders[i]
+    val b = finders[j]
+    val c = finders[k]
+    val ab = hypot(a.x - b.x, a.y - b.y)
+    val ac = hypot(a.x - c.x, a.y - c.y)
+    val bc = hypot(b.x - c.x, b.y - c.y)
+    // The corner is opposite the longest side.
+    val corner = if (bc >= ab && bc >= ac) i else if (ac >= ab) j else k
+    val first = if (corner == i) j else i
+    val second = if (corner == k) j else k
+    val cx = finders[corner].x
+    val cy = finders[corner].y
+    val firstX = finders[first].x - cx
+    val firstY = finders[first].y - cy
+    val secondX = finders[second].x - cx
+    val secondY = finders[second].y - cy
+    val cross = firstX * secondY - firstY * secondX
+    val lengthFirst = hypot(firstX, firstY)
+    val lengthSecond = hypot(secondX, secondY)
+    if (lengthFirst < 1.0 || lengthSecond < 1.0) return null
+    val sine = fabs(cross) / (lengthFirst * lengthSecond)
+    if (sine < 0.35) return null
+    val longest = fmax(lengthFirst, lengthSecond)
+    val shortest = fmin(lengthFirst, lengthSecond)
+    if (longest > shortest * 3.5) return null
+    val largest = fmax(a.moduleSize, fmax(b.moduleSize, c.moduleSize))
+    val smallest = fmin(a.moduleSize, fmin(b.moduleSize, c.moduleSize))
+    if (largest > smallest * 3.5) return null
+    if (shortest < largest * 7.0) return null
+    if (shortest / smallest > 180.0) return null
+    val score = (1.0 - sine) + (longest / shortest - 1.0) + (largest / smallest - 1.0)
+    // In image coordinates (y down) the top right lies clockwise of the bottom left.
+    if (cross > 0.0) Triple(corner, first, second, score) else Triple(corner, second, first, score)
+}
+
+private fun sortedTriples(finders: array<Finder>, limit: int): array<Triple> {
+    val triples: array<Triple> = []
+    for (i in 0 until finders.size) {
+        for (j in i + 1 until finders.size) {
+            for (k in j + 1 until finders.size) {
+                val triple = makeTriple(finders, i, j, k)
+                if (triple != null) triples.append(triple)
+            }
+        }
+    }
+    // Selection is enough for the few it keeps.
+    val result: array<Triple> = []
+    val taken = filledArray(triples.size, false)
+    while (result.size < limit && result.size < triples.size) {
+        var best = -1
+        for (index in 0 until triples.size)
+            if (!taken[index] && (best < 0 || triples[index].score < triples[best].score)) best = index
+        taken[best] = true
+        result.append(triples[best])
+    }
+    result
+}
+
+private fun strongFinders(found: array<Finder>): array<Finder> {
+    // Selection on hits, keeping a bounded number of candidates.
+    val taken = filledArray(found.size, false)
+    val result: array<Finder> = []
+    while (result.size < 20 && result.size < found.size) {
+        var best = -1
+        for (index in 0 until found.size)
+            if (!taken[index] && (best < 0 || found[index].hits > found[best].hits)) best = index
+        taken[best] = true
+        result.append(found[best])
+    }
+    result
+}
+
+private fun cornersOf(transform: Transform, size: int): array<QrPoint> {
+    val far = f64FromInt(size)
+    [
+        QrPoint(transform.x(0.0, 0.0), transform.y(0.0, 0.0)),
+        QrPoint(transform.x(far, 0.0), transform.y(far, 0.0)),
+        QrPoint(transform.x(far, far), transform.y(far, far)),
+        QrPoint(transform.x(0.0, far), transform.y(0.0, far))
+    ]
+}
+
+private fun outcome(decoded: QrDecoded, transform: Transform, size: int): QrReadResult {
+    var corners = cornersOf(transform, size)
+    if (decoded.mirrored) corners = [corners[0], corners[3], corners[2], corners[1]]
+    QrReadResult(true, "", decoded, corners)
+}
+
+private fun tryDecodeAt(image: QrImage, bitmap: Bitmap, invert: bool, transform: Transform, size: int): QrReadResult? {
+    val plain = qrDecodeMatrix(sampleModules(bitmap, transform, size, null))
+    val direct = plain.decoded
+    if (direct != null) return outcome(direct, transform, size)
+    val version = qrVersionOfSize(size)
+    val warp = buildWarp(bitmap, transform, version)
+    if (warp != null) {
+        val bent = qrDecodeMatrix(sampleModules(bitmap, transform, size, warp)).decoded
+        if (bent != null) return outcome(bent, transform, size)
+    }
+    val gray = qrDecodeMatrix(sampleGray(image, transform, size, warp, invert)).decoded
+    if (gray != null) return outcome(gray, transform, size)
+    null
+}
+
+private fun readTriple(image: QrImage, bitmap: Bitmap, invert: bool, finders: array<Finder>, triple: Triple, var budget: array<int>): QrReadResult? {
+    val tl = finders[triple.topLeft]
+    val tr = finders[triple.topRight]
+    val bl = finders[triple.bottomLeft]
+    val moduleX = moduleAlong(bitmap, tl, tr)
+    val moduleY = moduleAlong(bitmap, tl, bl)
+    val spanX = hypot(tr.x - tl.x, tr.y - tl.y) / moduleX
+    val spanY = hypot(bl.x - tl.x, bl.y - tl.y) / moduleY
+    val estimated = f64ToInt(floor((spanX + spanY) / 2.0 + 7.5))
+    val nearest = ((estimated - 17 + 2) / 4) * 4 + 17
+    val sizes: array<int> = [nearest, nearest + 4, nearest - 4, nearest + 8, nearest - 8]
+    for (size in sizes) {
+        if (size >= 21 && size <= 177) {
+            val version = qrVersionOfSize(size)
+            val template = templateFor(version)
+            val near = f64FromInt(size) - 3.5
+            val span = f64FromInt(size - 7)
+            val moduleSize = (moduleX + moduleY) / 2.0
+            val ux = (tr.x - tl.x) / span
+            val uy = (tr.y - tl.y) / span
+            val vx = (bl.x - tl.x) / span
+            val vy = (bl.y - tl.y) / span
+            // Three finders and a fourth point, from the best source there is:
+            // the last alignment pattern, the finders' outer edges, a parallelogram.
+            val sourceSets: array<array<f64>> = []
+            val targetSets: array<array<f64>> = []
+            if (version >= 2) {
+                val anchor = f64FromInt(size) - 6.5
+                val along = (anchor - 3.5) / span
+                val predictedX = tl.x + (tr.x - tl.x) * along + (bl.x - tl.x) * along
+                val predictedY = tl.y + (tr.y - tl.y) * along + (bl.y - tl.y) * along
+                val radius = moduleSize * fmax(5.0, f64FromInt(size) / 6.0)
+                val spot = searchAlignment(bitmap, predictedX, predictedY, ux, uy, vx, vy, radius, fmax(moduleSize / 2.0, 1.0))
+                if (spot.score >= 21) {
+                    sourceSets.append([3.5, 3.5, near, 3.5, anchor, anchor, 3.5, near])
+                    targetSets.append([tl.x, tl.y, tr.x, tr.y, spot.x, spot.y, bl.x, bl.y])
+                }
+            }
+            val corner = farCorner(bitmap, tl, tr, bl, moduleSize)
+            if (corner.size == 2) {
+                val whole = f64FromInt(size)
+                sourceSets.append([3.5, 3.5, near, 3.5, whole, whole, 3.5, near])
+                targetSets.append([tl.x, tl.y, tr.x, tr.y, corner[0], corner[1], bl.x, bl.y])
+            }
+            sourceSets.append([3.5, 3.5, near, 3.5, near, near, 3.5, near])
+            targetSets.append([tl.x, tl.y, tr.x, tr.y, tr.x + bl.x - tl.x, tr.y + bl.y - tl.y, bl.x, bl.y])
+            for (set in 0 until sourceSets.size) {
+                if (budget[0] <= 0) return null
+                budget[0] -= 1
+                val sources = sourceSets[set]
+                val targets: array<f64> = []
+                for (value in targetSets[set]) targets.append(value)
+                refine(bitmap, template, sources, targets, moduleSize)
+                val transform = solveTransform(sources, targets)
+                if (transform != null) {
+                    val score = templateScore(bitmap, template, transform)
+                    if (score * 100 >= template.us.size * 60) {
+                        val read = tryDecodeAt(image, bitmap, invert, transform, size)
+                        if (read != null) return read
+                    }
+                }
+            }
+        }
+    }
+    null
+}
+
+private fun samePlace(a: QrReadResult, b: QrReadResult): bool {
+    val ax = (a.corners[0].x + a.corners[2].x) / 2.0
+    val ay = (a.corners[0].y + a.corners[2].y) / 2.0
+    val bx = (b.corners[0].x + b.corners[2].x) / 2.0
+    val by = (b.corners[0].y + b.corners[2].y) / 2.0
+    val extent = hypot(a.corners[0].x - a.corners[2].x, a.corners[0].y - a.corners[2].y)
+    hypot(ax - bx, ay - by) < extent / 2.0
+}
+
+// One binarization's codes go into `results`. True when `first` is satisfied.
+private fun readWith(var results: array<QrReadResult>, var located: array<bool>, first: bool, image: QrImage, bitmap: Bitmap, invert: bool): bool {
+    val finders = strongFinders(findFinders(bitmap))
+    if (finders.size >= 3) located[0] = true
+    val used = filledArray(finders.size, false)
+    // Refining is the costly step. On a busy image without codes this keeps
+    // the work per binarization bounded.
+    val budget = [60]
+    for (triple in sortedTriples(finders, 40)) {
+        if (!used[triple.topLeft] && !used[triple.topRight] && !used[triple.bottomLeft]) {
+            val read = readTriple(image, bitmap, invert, finders, triple, budget)
+            if (read != null) {
+                budget[0] = 60
+                used[triple.topLeft] = true
+                used[triple.topRight] = true
+                used[triple.bottomLeft] = true
+                var known = false
+                for (other in results) if (samePlace(other, read)) known = true
+                if (!known) results.append(read)
+                if (first) return true
+            }
+        }
+    }
+    false
+}
+
+private fun readImage(image: QrImage, first: bool): array<QrReadResult> {
+    val results: array<QrReadResult> = []
+    val located = [false]
+    val longest = max(image.width, image.height)
+    val global = binarizeGlobal(image)
+    if (readWith(results, located, first, image, global, false)) return results
+    val table = integral(image)
+    if (readWith(results, located, first, image, binarizeLocal(image, max(longest / 8, 8), table), false)) return results
+    if (readWith(results, located, first, image, binarizeLocal(image, max(longest / 24, 6), table), false)) return results
+    val soft = boxBlur(image, max(longest / 700, 1))
+    if (readWith(results, located, first, soft, binarizeGlobal(soft), false)) return results
+    val softTable = integral(soft)
+    val softLocal = binarizeLocal(soft, max(longest / 16, 8), softTable)
+    if (readWith(results, located, first, soft, softLocal, false)) return results
+    // Light modules on a dark background.
+    if (readWith(results, located, first, image, inverted(global), true)) return results
+    if (readWith(results, located, first, soft, inverted(softLocal), true)) return results
+    if (results.size == 0)
+        results.append(QrReadResult(false, if (located[0]) "undecodable" else "not_found", null, array<QrPoint>()))
+    results
+}
+
+// Reads one code from an image: the first it can decode.
+fun qrRead(image: QrImage): QrReadResult {
+    val results = readImage(image, true)
+    val first = results[0]
+    QrReadResult(first.succeeded, first.error, first.decoded, first.corners)
+}
+
+// Reads every code it can find. Empty when none decodes.
+fun qrReadAll(image: QrImage): array<QrReadResult> {
+    val results: array<QrReadResult> = []
+    for (result in readImage(image, false)) if (result.succeeded) results.append(result)
+    results
+}
+
+// Decodes a PNG file's bytes and reads one code from it.
+fun qrReadPng(png: string): QrReadResult {
+    val image = qrPngDecode(png)
+    val pixels = image.image
+    if (pixels == null) return QrReadResult(false, image.error, null, array<QrPoint>())
+    qrRead(pixels)
+}
