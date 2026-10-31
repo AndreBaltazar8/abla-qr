@@ -1,0 +1,250 @@
+// From a module matrix back to data: format, unmasking, Reed-Solomon, segments.
+
+import "abla/bytes"
+import "abla/text"
+import "tables.ab"
+import "reedsolomon.ab"
+import "matrix.ab"
+
+class QrDecodedSegment(val mode: int, val data: string, val eci: int)
+
+class QrDecoded(
+    // The concatenated data of every segment, as stored; see `eci` for its encoding.
+    val data: string,
+    val version: int,
+    val errorCorrection: QrErrorCorrection,
+    val mask: int,
+    val segments: array<QrDecodedSegment>,
+    // Bytes Reed-Solomon had to repair.
+    val correctedErrors: int,
+    // True when the modules read as a mirror image of the code.
+    val mirrored: bool
+)
+
+class QrDecodeResult(val succeeded: bool, val error: string, val decoded: QrDecoded?)
+
+private fun failed(error: string): QrDecodeResult = QrDecodeResult(false, error, null)
+
+private class Format(val ec: QrErrorCorrection, val mask: int, val distance: int)
+
+private fun readWord(matrix: QrMatrix, places: array<int>): int {
+    var word = 0
+    for (index in 0 until places.size)
+        if (matrix.modules[places[index]]) word = word | (1 << index)
+    word
+}
+
+// The closest valid format word to either copy; BCH(15, 5) corrects up to 3 bits.
+private fun readFormat(matrix: QrMatrix): Format? {
+    val first = readWord(matrix, qrFormatPlaces(matrix.size, 0))
+    val second = readWord(matrix, qrFormatPlaces(matrix.size, 1))
+    var best: Format? = null
+    var bestDistance = 4
+    for (level in 0..3) {
+        for (mask in 0 until 8) {
+            val ec = QrErrorCorrection(level)
+            val word = qrFormatWord(ec, mask)
+            val a = qrPopCount(word ^ first)
+            val b = qrPopCount(word ^ second)
+            val distance = if (a < b) a else b
+            if (distance < bestDistance) {
+                bestDistance = distance
+                best = Format(ec, mask, distance)
+            }
+        }
+    }
+    best
+}
+
+// From version 7 the version is also written out. The size decides, unless a
+// copy cleanly names a different version: then this is the wrong grid.
+private fun versionIsConsistent(matrix: QrMatrix, version: int): bool {
+    if (version < 7) return true
+    for (copy in 0..1) {
+        val word = readWord(matrix, qrVersionPlaces(matrix.size, copy))
+        for (candidate in 7..40)
+            if (candidate != version && word == qrVersionWord(candidate)) return false
+    }
+    true
+}
+
+private class BitCursor(val bytes: array<int>, var at: int) {
+    fun remaining(): int = this.bytes.size * 8 - this.at
+
+    fun take(count: int): int {
+        var value = 0
+        for (index in 0 until count) {
+            val bit = (this.bytes[this.at / 8] >>> (7 - this.at % 8)) & 1
+            value = (value << 1) | bit
+            this.at += 1
+        }
+        value
+    }
+}
+
+private fun parseSegments(bytes: array<int>, version: int): array<QrDecodedSegment>? {
+    val cursor = BitCursor(bytes, 0)
+    val segments: array<QrDecodedSegment> = []
+    var eci = -1
+    while (cursor.remaining() >= 4) {
+        val mode = cursor.take(4)
+        if (mode == 0) return segments
+        if (mode == 7) {
+            if (cursor.remaining() < 8) return null
+            val first = cursor.take(8)
+            if ((first & 0x80) == 0) {
+                eci = first
+            } else if ((first & 0xC0) == 0x80) {
+                if (cursor.remaining() < 8) return null
+                eci = ((first & 0x3F) << 8) | cursor.take(8)
+            } else if ((first & 0xE0) == 0xC0) {
+                if (cursor.remaining() < 16) return null
+                eci = ((first & 0x1F) << 16) | cursor.take(16)
+            } else {
+                return null
+            }
+        } else if (mode == 3) {
+            // Structured append: position, total and parity precede the data.
+            if (cursor.remaining() < 16) return null
+            cursor.take(16)
+        } else if (mode == 5) {
+            // FNC1 first position: a marker, no field of its own.
+        } else if (mode == 9) {
+            if (cursor.remaining() < 8) return null
+            cursor.take(8)
+        } else if (mode == qrModeNumeric || mode == qrModeAlphanumeric || mode == qrModeByte || mode == qrModeKanji) {
+            val countBits = qrCharCountBits(mode, version)
+            if (cursor.remaining() < countBits) return null
+            val count = cursor.take(countBits)
+            val out = byteBuffer()
+            if (mode == qrModeNumeric) {
+                var left = count
+                while (left > 0) {
+                    val take = if (left >= 3) 3 else left
+                    val width = take * 3 + 1
+                    if (cursor.remaining() < width) return null
+                    val value = cursor.take(width)
+                    val limit = if (take == 3) 1000 else if (take == 2) 100 else 10
+                    if (value >= limit) return null
+                    if (take == 3) out.appendByteValue(48 + value / 100)
+                    if (take >= 2) out.appendByteValue(48 + value / 10 % 10)
+                    out.appendByteValue(48 + value % 10)
+                    left -= take
+                }
+            } else if (mode == qrModeAlphanumeric) {
+                var left = count
+                while (left >= 2) {
+                    if (cursor.remaining() < 11) return null
+                    val value = cursor.take(11)
+                    if (value >= 45 * 45) return null
+                    out.appendByteValue(qrAlphanumericCharset[value / 45])
+                    out.appendByteValue(qrAlphanumericCharset[value % 45])
+                    left -= 2
+                }
+                if (left == 1) {
+                    if (cursor.remaining() < 6) return null
+                    val value = cursor.take(6)
+                    if (value >= 45) return null
+                    out.appendByteValue(qrAlphanumericCharset[value])
+                }
+            } else if (mode == qrModeByte) {
+                if (cursor.remaining() < count * 8) return null
+                for (index in 0 until count) out.appendByteValue(cursor.take(8))
+            } else {
+                // Kanji comes out as its Shift JIS bytes.
+                if (cursor.remaining() < count * 13) return null
+                for (index in 0 until count) {
+                    val value = cursor.take(13)
+                    val packed = (value / 0xC0 << 8) | (value % 0xC0)
+                    val shifted = if (packed < 0x1F00) packed + 0x8140 else packed + 0xC140
+                    out.appendByteValue((shifted >>> 8) & 255)
+                    out.appendByteValue(shifted & 255)
+                }
+            }
+            segments.append(QrDecodedSegment(mode, out.toText(), eci))
+        } else {
+            return null
+        }
+    }
+    segments
+}
+
+// Reads the codewords off the matrix as they were placed, unmasking on the way.
+private fun readCodewords(matrix: QrMatrix, version: int, mask: int): array<int> {
+    val path = qrDataPath(version)
+    val total = qrTotalCodewords(version)
+    val result = filledArray(total, 0)
+    for (index in 0 until total * 8) {
+        val place = path[index]
+        var bit = matrix.modules[place]
+        if (qrMaskBit(mask, place % matrix.size, place / matrix.size)) bit = !bit
+        if (bit) result[index / 8] = result[index / 8] | (1 << (7 - index % 8))
+    }
+    result
+}
+
+private fun decodeOriented(matrix: QrMatrix, mirrored: bool): QrDecodeResult {
+    val size = matrix.size
+    if (size < 21 || size > 177 || size % 4 != 1) return failed("invalid_size")
+    val version = qrVersionOfSize(size)
+    val format = readFormat(matrix)
+    if (format == null) return failed("format_unreadable")
+    if (!versionIsConsistent(matrix, version)) return failed("version_mismatch")
+    val ec = format.ec
+    val codewords = readCodewords(matrix, version, format.mask)
+
+    val blocks = qrBlockCount(version, ec)
+    val eccLength = qrEccCodewordsPerBlock(version, ec)
+    val total = qrTotalCodewords(version)
+    val shortBlocks = blocks - total % blocks
+    val shortLength = total / blocks
+    val shortData = shortLength - eccLength
+    val pieces: array<array<int>> = []
+    for (block in 0 until blocks)
+        pieces.append(filledArray(if (block < shortBlocks) shortLength else shortLength + 1, 0))
+    var at = 0
+    for (index in 0..shortData) {
+        for (block in 0 until blocks) {
+            if (block >= shortBlocks || index < shortData) {
+                pieces[block][index] = codewords[at]
+                at += 1
+            }
+        }
+    }
+    for (index in 0 until eccLength) {
+        for (block in 0 until blocks) {
+            val dataLength = if (block < shortBlocks) shortData else shortData + 1
+            pieces[block][dataLength + index] = codewords[at]
+            at += 1
+        }
+    }
+    var corrected = 0
+    val capacity = qrRsCapacity(eccLength)
+    val data: array<int> = []
+    for (block in 0 until blocks) {
+        val piece = filledArray(pieces[block].size, 0)
+        for (index in 0 until piece.size) piece[index] = pieces[block][index]
+        val repaired = qrRsCorrect(piece, eccLength, capacity)
+        if (repaired < 0) return failed("too_many_errors")
+        corrected += repaired
+        for (index in 0 until piece.size - eccLength) data.append(piece[index])
+    }
+    val segments = parseSegments(data, version)
+    if (segments == null) return failed("invalid_segments")
+    val parts: array<string> = []
+    for (segment in segments) parts.append(segment.data)
+    QrDecodeResult(true, "", QrDecoded(textJoin(parts), version, ec, format.mask, segments, corrected, mirrored))
+}
+
+// Decodes a square matrix of modules, trying its mirror image if needed.
+fun qrDecodeMatrix(matrix: QrMatrix): QrDecodeResult {
+    val direct = decodeOriented(matrix, false)
+    if (direct.succeeded) return direct
+    val size = matrix.size
+    val flipped = filledArray(size * size, false)
+    for (y in 0 until size)
+        for (x in 0 until size)
+            flipped[x * size + y] = matrix.modules[y * size + x]
+    val other = decodeOriented(QrMatrix(size, flipped, matrix.version, matrix.errorCorrection, matrix.mask), true)
+    if (other.succeeded) other else direct
+}

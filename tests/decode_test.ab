@@ -1,0 +1,195 @@
+import "abla/test"
+import "abla/bytes"
+import "abla/text"
+import "support.ab"
+import "../src/qr.ab"
+
+private fun readBack(matrix: QrMatrix): string {
+    val result = qrDecodeMatrix(matrix)
+    val decoded = result.decoded
+    if (decoded == null) return "failed: ${result.error}"
+    decoded.data
+}
+
+private fun copied(matrix: QrMatrix): QrMatrix {
+    val modules = filledArray(matrix.modules.size, false)
+    for (index in 0 until modules.size) modules[index] = matrix.modules[index]
+    QrMatrix(matrix.size, modules, matrix.version, matrix.errorCorrection, matrix.mask)
+}
+
+private fun allBytes(): string {
+    val out = byteBuffer()
+    for (byte in 0 until 256) out.appendByteValue(byte)
+    out.toText()
+}
+
+fun main: int {
+    // Every version and level, at capacity, in each mode that fits.
+    for (version in 1..40) {
+        for (level in 0..3) {
+            val ec = QrErrorCorrection(level)
+            val options = QrOptions(errorCorrection = ec, minVersion = version, maxVersion = version)
+            val fit = qrDataCodewords(version, ec) * 8 - 4 - qrCharCountBits(qrModeByte, version)
+            val text = "Abla! ".repeat(fit / 48 + 1).slice(0, fit / 8)
+            val matrix = qrEncode(text, options).matrix
+            if (matrix != null) {
+                expectEqual(readBack(matrix), text, "byte v$version level $level")
+                val decoded = qrDecodeMatrix(matrix).decoded
+                if (decoded != null) {
+                    expectEqual(decoded.version, version, "version read back")
+                    expectEqual(int(decoded.errorCorrection), level, "level read back")
+                    expectEqual(decoded.mask, matrix.mask, "mask read back")
+                    expectEqual(decoded.correctedErrors, 0, "no repairs needed")
+                    expect(!decoded.mirrored, "not mirrored")
+                }
+            } else expect(false, "encode v$version level $level")
+        }
+    }
+
+    // Modes, including the lengths where numeric and alphanumeric end oddly.
+    for (text in ["", "0", "01", "012", "0123", "00000000000000000", "A", "AB", "ABC", "HELLO WORLD",
+                  "$%*+-./: ", "a", "Olá mundo €", "日本語のテキスト", "line\nbreak\ttab"]) {
+        val matrix = qrEncode(text).matrix
+        if (matrix != null) expectEqual(readBack(matrix), text, "mode test")
+        else expect(false, "encode mode test")
+    }
+    val binary = allBytes()
+    val binaryMatrix = qrEncode(binary).matrix
+    if (binaryMatrix != null) expectEqual(readBack(binaryMatrix), binary, "every byte value")
+    else expect(false, "encode binary")
+
+    // ECI and several segments.
+    val eci = qrEncode("Olá", QrOptions(utf8Eci = true)).matrix
+    if (eci != null) {
+        val decoded = qrDecodeMatrix(eci).decoded
+        if (decoded != null) {
+            expectEqual(decoded.data, "Olá", "ECI data")
+            expectEqual(decoded.segments.size, 1, "ECI segment count")
+            expectEqual(decoded.segments[0].eci, 26, "ECI designator read")
+        } else expect(false, "ECI decodes")
+    }
+    for (designator in [3, 127, 128, 16383, 16384, 999999]) {
+        val matrix = qrEncodeSegments([QrSegment(qrModeByte, "data", designator)]).matrix
+        if (matrix != null) {
+            val decoded = qrDecodeMatrix(matrix).decoded
+            if (decoded != null) expectEqual(decoded.segments[0].eci, designator, "ECI $designator")
+            else expect(false, "ECI $designator decodes")
+        }
+    }
+    val mixed = qrEncodeSegments([
+        QrSegment(qrModeAlphanumeric, "ORDER:"),
+        QrSegment(qrModeNumeric, "000123456789"),
+        QrSegment(qrModeByte, "/ok")
+    ]).matrix
+    if (mixed != null) {
+        val decoded = qrDecodeMatrix(mixed).decoded
+        if (decoded != null) {
+            expectEqual(decoded.data, "ORDER:000123456789/ok", "mixed data")
+            expectEqual(decoded.segments.size, 3, "mixed segments")
+            expectEqual(decoded.segments[1].mode, qrModeNumeric, "mixed numeric")
+        } else expect(false, "mixed decodes")
+    } else expect(false, "mixed encodes")
+
+    // Damage: flipped modules up to what each level should bear.
+    val random = TestRandom(99)
+    val text = "Damage test payload with some length to it. ".repeat(2)
+    for (level in 0..3) {
+        val original = qrEncode(text, QrOptions(errorCorrection = QrErrorCorrection(level), minVersion = 10, maxVersion = 10)).matrix
+        if (original != null) {
+            val path = qrDataPath(10)
+            val eccBlock = qrEccCodewordsPerBlock(10, QrErrorCorrection(level))
+            val blocks = qrBlockCount(10, QrErrorCorrection(level))
+            // Whole codewords in distinct blocks, up to half the check bytes of each.
+            val damaged = copied(original)
+            val total = qrTotalCodewords(10)
+            for (round in 0 until eccBlock / 2) {
+                for (block in 0 until blocks) {
+                    val codeword = (round + 2) * blocks + block
+                    if (codeword < total) {
+                        for (bit in 0 until 8) {
+                            val place = path[codeword * 8 + bit]
+                            if (random.next(2) == 0) damaged.modules[place] = !damaged.modules[place]
+                        }
+                    }
+                }
+            }
+            val result = qrDecodeMatrix(damaged)
+            val decoded = result.decoded
+            if (decoded != null) {
+                expectEqual(decoded.data, text, "repaired at level $level")
+                expect(decoded.correctedErrors > 0, "repairs counted at level $level")
+            } else expect(false, "level $level repairs: ${result.error}")
+        } else expect(false, "level $level encodes")
+    }
+
+    // Past correction it reports failure rather than garbage.
+    val fragile = qrEncode(text, QrOptions(errorCorrection = qrEcLow, minVersion = 10, maxVersion = 10)).matrix
+    if (fragile != null) {
+        val ruined = copied(fragile)
+        for (place in qrDataPath(10)) if (random.next(2) == 0) ruined.modules[place] = !ruined.modules[place]
+        val result = qrDecodeMatrix(ruined)
+        expect(!result.succeeded, "ruined code fails")
+        expectEqual(result.error, "too_many_errors", "ruined code's error")
+
+        // Format information: three bad bits in one copy, all of the other gone.
+        val format = copied(fragile)
+        val first = qrFormatPlaces(format.size, 0)
+        val second = qrFormatPlaces(format.size, 1)
+        for (index in 0 until 3) format.modules[first[index * 4]] = !format.modules[first[index * 4]]
+        for (place in second) format.modules[place] = false
+        expectEqual(readBack(format), text, "format survives bit errors")
+
+        val noFormat = copied(fragile)
+        for (place in first) noFormat.modules[place] = random.next(2) == 0
+        for (index in 0 until 15) noFormat.modules[second[index]] = !noFormat.modules[first[index]]
+        // Whatever the noise says, it must not crash; usually it fails.
+        qrDecodeMatrix(noFormat)
+    }
+    val versioned = qrEncode("version info", QrOptions(minVersion = 7, maxVersion = 7)).matrix
+    if (versioned != null) {
+        val damaged = copied(versioned)
+        for (index in 0 until 18) {
+            val place = qrVersionPlaces(damaged.size, 0)[index]
+            damaged.modules[place] = index % 2 == 0
+        }
+        expectEqual(readBack(damaged), "version info", "one version copy damaged")
+
+        // A copy clearly naming another version means the grid is wrong.
+        val wrong = copied(versioned)
+        val word = qrVersionWord(9)
+        val places = qrVersionPlaces(wrong.size, 1)
+        for (index in 0 until 18) wrong.modules[places[index]] = ((word >>> index) & 1) == 1
+        expectEqual(qrDecodeMatrix(wrong).error, "version_mismatch", "version disagreement")
+    }
+
+    // A mirror image reads, and says so.
+    val plain = qrEncode("mirror").matrix
+    if (plain != null) {
+        val size = plain.size
+        val flipped = filledArray(size * size, false)
+        for (y in 0 until size) for (x in 0 until size) flipped[x * size + y] = plain.modules[y * size + x]
+        val decoded = qrDecodeMatrix(qrMatrixFromModules(size, flipped)).decoded
+        if (decoded != null) {
+            expectEqual(decoded.data, "mirror", "mirrored data")
+            expect(decoded.mirrored, "mirrored flag")
+        } else expect(false, "mirrored decodes")
+    }
+
+    // Noise and wrong sizes fail cleanly, never by a panic.
+    for (size in [0, 3, 20, 22, 181]) {
+        expect(!qrDecodeMatrix(qrMatrixFromModules(size, filledArray(size * size, true))).succeeded, "size $size")
+    }
+    for (trial in 0 until 300) {
+        val version = 1 + random.next(12)
+        val size = qrSizeOfVersion(version)
+        val modules = filledArray(size * size, false)
+        for (index in 0 until modules.size) modules[index] = random.next(2) == 0
+        // A valid format often leads on into segment parsing.
+        val word = qrFormatWord(QrErrorCorrection(random.next(4)), random.next(8))
+        val places = qrFormatPlaces(size, 0)
+        for (index in 0 until 15) modules[places[index]] = ((word >>> index) & 1) == 1
+        qrDecodeMatrix(qrMatrixFromModules(size, modules))
+    }
+    expect(true, "noise didn't panic")
+    testsPassed()
+}
