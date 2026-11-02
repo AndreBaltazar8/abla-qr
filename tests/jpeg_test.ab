@@ -1,0 +1,144 @@
+// JPEG decoding against libjpeg's output, the committed files' codes, and
+// hostile input. The fixtures come from tools/make_jpeg_fixtures.py.
+
+import "abla/test"
+import "abla/text"
+import "abla/bytes"
+import "abla/crypto"
+import "abla/fs"
+import "support.ab"
+import "../src/qr.ab"
+
+private fun parseInt(text: string): int {
+    var value = 0
+    for (byte in text) value = value * 10 + byte - 48
+    value
+}
+
+private fun replaced(text: string, at: int, byte: int): string {
+    val out = byteBuffer()
+    out.appendText(text.slice(0, at))
+    out.appendByteValue(byte)
+    out.appendText(text.slice(at + 1, text.size))
+    out.toText()
+}
+
+private fun segment(marker: int, body: string): string {
+    val out = byteBuffer()
+    out.appendByteValue(0xFF)
+    out.appendByteValue(marker)
+    out.appendByteValue((body.size + 2) >>> 8)
+    out.appendByteValue((body.size + 2) & 255)
+    out.appendText(body)
+    out.toText()
+}
+
+private fun bytesOf(values: array<int>): string {
+    val out = byteBuffer()
+    for (value in values) out.appendByteValue(value)
+    out.toText()
+}
+
+fun main: int {
+    val folder = "tests/fixtures/jpeg/"
+    val lines = Path(folder + "expected.tsv").readText().trim().split("\n")
+    expectEqual(lines.size, 19, "fixture count")
+    val files: array<string> = []
+    for (line in lines) {
+        val fields = line.split("\t")
+        val name = fields[0]
+        val jpeg = Path(folder + name).readText()
+        val decoded = qrJpegDecode(jpeg)
+        if (fields[1] == "-") {
+            expectEqual(decoded.error, fields[3], "$name is refused")
+            continue
+        }
+        files.append(jpeg)
+        val image = decoded.image
+        val reference = qrPngDecode(Path(folder + fields[1]).readText()).image
+        if (image != null && reference != null) {
+            expectEqual(image.width, reference.width, "$name width")
+            expectEqual(image.height, reference.height, "$name height")
+            var worst = 0
+            if (image.pixels.size == reference.pixels.size) {
+                for (index in 0 until image.pixels.size) {
+                    val difference = int(image.pixels[index]) - int(reference.pixels[index])
+                    val size = if (difference < 0) -difference else difference
+                    if (size > worst) worst = size
+                }
+            }
+            expect(worst <= parseInt(fields[2]), "$name differs from libjpeg by $worst")
+        } else expect(false, "$name: ${decoded.error}")
+        val read = qrReadJpeg(jpeg)
+        val code = read.decoded
+        if (code != null) expectEqual(hexEncode(code.data), fields[3], "$name reads")
+        else expect(false, "$name reads: ${read.error}")
+    }
+
+    // Files told apart by their first bytes.
+    val baseline = Path(folder + "baseline-420-q90.jpg").readText()
+    val progressive = Path(folder + "progressive-restart.jpg").readText()
+    expect(qrReadImageFile(baseline).succeeded, "a JPEG file")
+    val matrix = testMatrix("png or jpeg")
+    if (matrix != null) {
+        val read = qrReadImageFile(qrPng(matrix)).decoded
+        if (read != null) expectEqual(read.data, "png or jpeg", "a PNG file") else expect(false, "a PNG file")
+    } else expect(false, "encodes")
+    expectEqual(qrReadImageFile("GIF89a......").error, "unknown_format", "neither")
+    expectEqual(qrReadImageFile("").error, "unknown_format", "empty")
+
+    // Malformed files come back as errors.
+    expectEqual(qrJpegDecode("").error, "not_jpeg", "empty")
+    expectEqual(qrJpegDecode("not a jpeg").error, "not_jpeg", "text")
+    expectEqual(qrJpegDecode(baseline, 1000).error, "too_large", "pixel limit")
+    expect(qrJpegDecode(baseline, 83 * 77).succeeded, "exactly at the limit")
+    expectEqual(qrJpegDecode(bytesOf([0xFF, 0xD8, 0xFF, 0xD9])).error, "no_frame", "no frame")
+    expectEqual(qrJpegDecode(bytesOf([0xFF, 0xD8, 0xFF, 0xE0, 0])).error, "truncated", "cut in a marker")
+    expect(!qrJpegDecode(baseline.slice(0, 300)).succeeded, "cut in the headers")
+    expectEqual(qrJpegDecode(baseline.slice(0, baseline.size / 2)).error, "truncated", "cut in the data")
+    expectEqual(qrJpegDecode(progressive.slice(0, progressive.size * 2 / 3)).error, "truncated", "cut in a later scan")
+    // A frame claiming the largest size there is, with no data behind it.
+    val huge = bytesOf([0xFF, 0xD8]) + segment(0xC0, bytesOf([8, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 0x11, 0])) + bytesOf([0xFF, 0xD9])
+    expectEqual(qrJpegDecode(huge, 1000000).error, "too_large", "huge frame")
+    val noHeight = bytesOf([0xFF, 0xD8]) + segment(0xC0, bytesOf([8, 0, 0, 0, 16, 1, 1, 0x11, 0]))
+    expectEqual(qrJpegDecode(noHeight).error, "unsupported_dnl", "height given later")
+    val twoComponents = bytesOf([0xFF, 0xD8]) + segment(0xC0, bytesOf([8, 0, 8, 0, 8, 2, 1, 0x11, 0, 2, 0x11, 0]))
+    expectEqual(qrJpegDecode(twoComponents).error, "unsupported_components", "two components")
+    val badSampling = bytesOf([0xFF, 0xD8]) + segment(0xC0, bytesOf([8, 0, 8, 0, 8, 1, 1, 0x51, 0]))
+    expectEqual(qrJpegDecode(badSampling).error, "bad_frame", "sampling factor 5")
+    val badTable = bytesOf([0xFF, 0xD8]) + segment(0xC4, bytesOf([0x00, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]))
+    expectEqual(qrJpegDecode(badTable).error, "bad_table", "more codes of one bit than there are")
+
+    // Any corrupted byte, random truncations, and random segments: an error or
+    // an image, never a panic.
+    val random = TestRandom(4242)
+    var decodedAnyway = 0
+    for (trial in 0 until 3000) {
+        val file = files[trial % files.size]
+        var damaged = replaced(file, random.next(file.size), random.next(256))
+        if (trial % 3 == 0) damaged = replaced(damaged, random.next(file.size), random.next(256))
+        if (qrJpegDecode(damaged).succeeded) decodedAnyway += 1
+    }
+    expect(decodedAnyway > 0, "some damaged files still decode")
+    for (trial in 0 until 600) {
+        val file = files[trial % files.size]
+        qrJpegDecode(file.slice(0, random.next(file.size)))
+    }
+    val markers = [0xC0, 0xC1, 0xC2, 0xC4, 0xDB, 0xDD, 0xDA, 0xE0, 0xEE, 0xD0, 0xD9]
+    for (trial in 0 until 3000) {
+        val out = byteBuffer()
+        out.appendByteValue(0xFF)
+        out.appendByteValue(0xD8)
+        // Keep a real frame and tables now and then, so scans get decoded.
+        if (trial % 2 == 0) out.appendText(baseline.slice(2, 2 + random.next(baseline.size / 4)))
+        for (piece in 0 until 1 + random.next(6)) {
+            val body = byteBuffer()
+            for (index in 0 until random.next(40)) body.appendByteValue(if (random.next(4) == 0) random.next(5) else random.next(256))
+            out.appendText(segment(markers[random.next(markers.size)], body.toText()))
+            for (index in 0 until random.next(30)) out.appendByteValue(random.next(256))
+        }
+        qrJpegDecode(out.toText(), 1000000)
+    }
+    expect(true, "no panic on noise")
+    testsPassed()
+}

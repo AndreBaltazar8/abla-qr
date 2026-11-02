@@ -12,6 +12,7 @@ import "tables.ab"
 import "matrix.ab"
 import "image.ab"
 import "png.ab"
+import "jpeg.ab"
 import "decode.ab"
 
 class QrPoint(val x: f64, val y: f64)
@@ -953,4 +954,20 @@ fun qrReadPng(png: string): QrReadResult {
     val pixels = image.image
     if (pixels == null) return QrReadResult(false, image.error, null, array<QrPoint>())
     qrRead(pixels)
+}
+
+// Decodes a JPEG file's bytes and reads one code from it.
+fun qrReadJpeg(jpeg: string): QrReadResult {
+    val image = qrJpegDecode(jpeg)
+    val pixels = image.image
+    if (pixels == null) return QrReadResult(false, image.error, null, array<QrPoint>())
+    qrRead(pixels)
+}
+
+// Reads one code from a PNG or JPEG file, told apart by their first bytes.
+// Anything else is "unknown_format".
+fun qrReadImageFile(bytes: string): QrReadResult {
+    if (bytes.size >= 8 && bytes.slice(0, 8) == qrPngSignature()) return qrReadPng(bytes)
+    if (qrIsJpeg(bytes)) return qrReadJpeg(bytes)
+    QrReadResult(false, "unknown_format", null, array<QrPoint>())
 }

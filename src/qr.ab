@@ -5,6 +5,7 @@ import "encode.ab"
 import "render.ab"
 import "image.ab"
 import "png.ab"
+import "jpeg.ab"
 import "decode.ab"
 import "reader.ab"
 

@@ -14,7 +14,7 @@ fun writeTicket(url: string): bool {
         Path("ticket.png").writeTextAtomic(qrPng(matrix))
 }
 
-fun readTicket(png: string): string? = qrReadPng(png).decoded?.data
+fun readTicket(photo: string): string? = qrReadImageFile(photo).decoded?.data
 ```
 
 ## Creating
@@ -50,16 +50,20 @@ standard asks for), `darkColor` and `lightColor` as `0xRRGGBB`, and
 
 | Function | |
 |---|---|
+| `qrReadImageFile(bytes)` | one code from a PNG or JPEG file's bytes, told apart by their first bytes |
 | `qrReadPng(bytes)` | one code from a PNG file's bytes |
+| `qrReadJpeg(bytes)` | one code from a JPEG file's bytes |
 | `qrRead(image)` | one code from a `QrImage` |
 | `qrReadAll(image)` | every code it finds |
 | `qrPngDecode(bytes, maxPixels)` | PNG to `QrImage`: any colour type or depth, Adam7, transparency |
+| `qrJpegDecode(bytes, maxPixels)` | JPEG to `QrImage`: baseline, extended and progressive, any sampling, restart markers |
+| `qrIsJpeg(bytes)` | whether bytes start like a JPEG file (`qrPngSignature()` is PNG's) |
 | `qrImageFromBytes(width, height, channels, data)` | raw gray, gray and alpha, RGB or RGBA to `QrImage` |
 | `qrDecodeMatrix(matrix)` | when you already have the modules |
 
-A `QrReadResult` has `succeeded`, `error` (`not_found`, `undecodable` or a PNG
-error), `decoded` and `corners`, the code's four corners in the image. `decoded`
-is a `QrDecoded`: `data`, `version`, `errorCorrection`, `mask`, `segments`,
+A `QrReadResult` has `succeeded`, `error` (`not_found`, `undecodable`, a PNG or
+JPEG error, or `unknown_format` from `qrReadImageFile`), `decoded` and
+`corners`, the code's four corners in the image. `decoded` is a `QrDecoded`: `data`, `version`, `errorCorrection`, `mask`, `segments`,
 `correctedErrors` and `mirrored`.
 
 The reader tries a global threshold, then local thresholds for uneven light, then
@@ -70,14 +74,37 @@ what remains. Numeric, alphanumeric, byte, Kanji, ECI, FNC1 and structured-appen
 symbols all read. Kanji comes out as its Shift JIS bytes, and non-UTF-8 ECI data
 as stored: `segments[i].eci` says which.
 
-Malformed files and images return errors. The PNG decoder treats every length as
-untrusted and the reader bounds its work, about ten seconds at worst on a 12
-megapixel image of pure noise on the machine it was measured on.
+Malformed files and images return errors. The PNG and JPEG decoders treat every
+length as untrusted and refuse images over `maxPixels` (100 million by default)
+before allocating, and the reader bounds its work, about ten seconds at worst on
+a 12 megapixel image of pure noise on the machine it was measured on.
+
+The JPEG decoder handles Huffman-coded baseline (SOF0), extended sequential
+(SOF1) and progressive (SOF2) files with 8-bit samples: any sampling factors
+(4:4:4, 4:2:2, 4:2:0, 4:1:1, ...), restart intervals, several quantization and
+Huffman tables, 16-bit quantization tables, and APPn, COM and EXIF segments,
+which it skips. It decodes gray only. For gray and YCbCr files that is the Y
+component, which it reconstructs with libjpeg's accurate integer IDCT, so the
+pixels equal `djpeg -grayscale`'s. Chroma is Huffman-decoded to keep the stream
+in step and then dropped, and progressive scans of chroma alone are skipped. RGB
+and Adobe CMYK files are converted to luma; Adobe YCCK uses Y and K. A 12
+megapixel 4:2:0 photo decodes in about 0.25 seconds baseline and 0.4 seconds
+progressive (release ablac 0.2.30, i9-13900K). Errors are `not_jpeg`,
+`truncated`, `too_large`, `bad_frame`, `bad_table`, `bad_scan`, `bad_data`,
+`bad_marker`, `bad_restart`, `missing_table`, `no_frame`, `no_data`,
+`too_many_scans` (over 64) and the `unsupported_` ones below.
 
 ### Limits
 
-- **No JPEG.** The reader takes PNG or pixels. To read a JPEG, decode it first and
-  pass the pixels to `qrImageFromBytes`.
+- JPEG: arithmetic coding (`unsupported_arithmetic`), 12-bit samples
+  (`unsupported_12_bit`), lossless (`unsupported_lossless`), hierarchical
+  (`unsupported_hierarchical`) files and a height given only in a DNL marker
+  (`unsupported_dnl`) are refused, and so are two-component files
+  (`unsupported_components`). EXIF orientation is not applied: the image comes
+  out as stored, which the reader doesn't mind, since it reads codes at any angle.
+  Like PNG, colour becomes luma, so a code that differs from its background only
+  in hue, not in brightness, won't read.
+- Other formats (HEIC, WebP, GIF) aren't decoded: pass pixels to `qrImageFromBytes`.
 - All three finder patterns must be found, though each can lose part of itself. A
   code with a finder wholly covered won't be located.
 - A code bowed by more than about 2.5 modules fails. ZXing reads somewhat more.
@@ -87,9 +114,12 @@ megapixel image of pure noise on the machine it was measured on.
 ## Tests
 
 `make test` builds the examples and runs the unit tests: tables against the
-standard, Reed-Solomon, the matrix of the standard's Annex I, PNG, rendering, and
-reader tests on images the tests warp themselves. They include noise fuzzing
-against panics.
+standard, Reed-Solomon, the matrix of the standard's Annex I, PNG, JPEG,
+rendering, and reader tests on images the tests warp themselves. They include
+noise fuzzing against panics. The JPEG files in `tests/fixtures/jpeg` hold one of
+this library's codes in each layout (sampling, progressive, restart markers,
+quality 12 to 90, EXIF, RGB, CMYK); their gray must equal libjpeg's, or for RGB
+and CMYK come within 2 of it, and their code must read.
 
 `make interop` checks against independent implementations, from Nix:
 

@@ -40,7 +40,8 @@ interop-in-shell:
 fixtures:
 	python3 tools/make_png_fixtures.py tests/fixtures/png
 	nix-shell $(NIXPKGS_IMPORT) tools/interop-shell.nix --run \
-		'python3 tools/make_fixtures.py tests/fixtures/photo-style --small'
+		'python3 tools/make_fixtures.py tests/fixtures/photo-style --small && \
+		python3 tools/make_jpeg_fixtures.py $(BUILD_DIR)/qrtool tests/fixtures/jpeg'
 
 clean:
 	@if [ -d "$(BUILD_DIR)" ]; then gio trash "$(BUILD_DIR)"; fi

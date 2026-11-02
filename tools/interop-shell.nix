@@ -5,6 +5,7 @@ pkgs.mkShell {
     pkgs.zbar
     pkgs.qrencode
     pkgs.librsvg
+    pkgs.libjpeg_turbo
     (pkgs.python3.withPackages (p: [ p.segno p.qrcode p.pillow p.numpy p.zxing-cpp ]))
   ];
 }

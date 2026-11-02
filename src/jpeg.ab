@@ -1,0 +1,787 @@
+// JPEG decoding to gray: baseline, extended sequential and progressive files
+// with Huffman coding. Every length in the file is untrusted: decoding fails
+// with an error instead of reading out of bounds, and memory is bounded by the
+// pixel limit.
+//
+// Only what gray needs is reconstructed. For YCbCr that is the Y component:
+// chroma is Huffman-decoded to keep the stream in step and then dropped, and
+// progressive scans of chroma alone are skipped without decoding. The inverse
+// DCT is libjpeg's accurate integer one, so Y comes out as djpeg's does.
+
+import "image.ab"
+
+private val zigzag: array<int> = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63
+]
+
+// Bits of entropy-coded data, with stuffed zero bytes removed. At a marker or
+// the end of the file it feeds zero bits and counts the bytes it made up.
+private class JpegBits(val data: string, var at: int, var bits: int, var count: int, var padded: int, var marker: bool) {
+    fun fill() {
+        while (this.count <= 48) {
+            var byte = 0
+            if (this.marker || this.at >= this.data.size) {
+                this.padded += 1
+            } else {
+                byte = this.data[this.at]
+                if (byte == 0xFF) {
+                    val next = if (this.at + 1 < this.data.size) this.data[this.at + 1] else -1
+                    if (next == 0) {
+                        this.at += 2
+                    } else {
+                        this.marker = true
+                        this.padded += 1
+                        byte = 0
+                    }
+                } else {
+                    this.at += 1
+                }
+            }
+            this.bits = (this.bits << 8) | byte
+            this.count += 8
+        }
+    }
+
+    fun take(wanted: int): int {
+        if (this.count < wanted) this.fill()
+        this.count -= wanted
+        (this.bits >>> this.count) & ((1 << wanted) - 1)
+    }
+
+    // Drops buffered bits at a restart and steps over the RSTn marker. False
+    // when the next marker is something else.
+    fun restart(): bool {
+        this.bits = 0
+        this.count = 0
+        this.padded = 0
+        this.marker = false
+        val at = jpegNextMarker(this.data, this.at)
+        if (at + 1 >= this.data.size) {
+            this.at = this.data.size
+            return false
+        }
+        if (this.data[at + 1] < 0xD0 || this.data[at + 1] > 0xD7) return false
+        this.at = at + 2
+        true
+    }
+}
+
+// The offset of the next marker at or after `at`: 0xFF followed by neither a
+// stuffed zero nor a fill byte. The file's size when there is none.
+private fun jpegNextMarker(data: string, start: int): int {
+    var at = start
+    while (at + 1 < data.size) {
+        if (data[at] == 0xFF) {
+            val next = data[at + 1]
+            if (next != 0 && next != 0xFF) return at
+        }
+        at += 1
+    }
+    data.size
+}
+
+// A Huffman table: codes of up to 9 bits through one lookup, longer ones by
+// the largest code of each length.
+private class JpegHuffman(val lookup: array<int>, val maxCode: array<int>, val offsets: array<int>, val values: array<int>, val defined: bool)
+
+private fun emptyHuffman(): JpegHuffman = JpegHuffman(array<int>(), array<int>(), array<int>(), array<int>(), false)
+
+private fun buildHuffman(counts: array<int>, values: array<int>): JpegHuffman? {
+    val lookup = filledArray(512, 0)
+    val maxCode = filledArray(17, -1)
+    val offsets = filledArray(17, 0)
+    var code = 0
+    var index = 0
+    for (length in 1..16) {
+        offsets[length] = index - code
+        val count = counts[length - 1]
+        if (count > 0) {
+            for (step in 0 until count) {
+                if (code >= (1 << length)) return null
+                if (length <= 9) {
+                    val shift = 9 - length
+                    val base = code << shift
+                    val entry = (length << 8) | values[index]
+                    for (fill in 0 until (1 << shift)) lookup[base + fill] = entry
+                }
+                code += 1
+                index += 1
+            }
+            maxCode[length] = code - 1
+        }
+        code = code << 1
+    }
+    JpegHuffman(lookup, maxCode, offsets, values, true)
+}
+
+// The next symbol, or -1 for a code the table doesn't have.
+private fun decodeSymbol(var reader: JpegBits, table: JpegHuffman): int {
+    if (reader.count < 16) reader.fill()
+    val count = reader.count
+    val entry = table.lookup[(reader.bits >>> (count - 9)) & 511]
+    if (entry != 0) {
+        reader.count = count - (entry >>> 8)
+        return entry & 255
+    }
+    val peek = (reader.bits >>> (count - 16)) & 0xFFFF
+    for (length in 10..16) {
+        val code = peek >>> (16 - length)
+        if (code <= table.maxCode[length]) {
+            val at = code + table.offsets[length]
+            if (at < 0 || at >= table.values.size) return -1
+            reader.count = count - length
+            return table.values[at]
+        }
+    }
+    -1
+}
+
+// A magnitude category's extra bits as a signed value.
+private fun receiveExtend(var reader: JpegBits, size: int): int {
+    if (size == 0) return 0
+    val value = reader.take(size)
+    if (value < (1 << (size - 1))) value - (1 << size) + 1 else value
+}
+
+private class JpegComponent(
+    val id: int,
+    val h: int,
+    val v: int,
+    val quantTable: int,
+    // Size in samples, and in blocks, without the padding of whole MCUs.
+    val width: int,
+    val height: int,
+    val blocksPerLine: int,
+    val blocksPerColumn: int,
+    var needed: bool,
+    var quant: array<int>,
+    var dcTable: int,
+    var acTable: int,
+    var predictor: int,
+    var plane: array<u8>,
+    // Progressive only: the coefficients of every block, in natural order.
+    var coefficients: array<i16>
+)
+
+// Fixed-point constants of libjpeg's jidctint.c, 13 fractional bits.
+private val fix0298631336 = 2446
+private val fix0390180644 = 3196
+private val fix0541196100 = 4433
+private val fix0765366865 = 6270
+private val fix0899976223 = 7373
+private val fix1175875602 = 9633
+private val fix1501321110 = 12299
+private val fix1847759065 = 15137
+private val fix1961570560 = 16069
+private val fix2053119869 = 16819
+private val fix2562915447 = 20995
+private val fix3072711026 = 25172
+
+private fun clampSample(value: int): u8 = if (value < 0) u8(0) else if (value > 255) u8(255) else u8(value)
+
+// libjpeg's jpeg_idct_islow on a dequantized block in natural order. Writes the
+// first `columns` by `rows` samples at `offset` of `plane`.
+private fun inverseDct(block: array<int>, var work: array<int>, var plane: array<u8>, offset: int, stride: int, columns: int, rows: int) {
+    for (column in 0 until 8) {
+        val d1 = block[8 + column]
+        val d2 = block[16 + column]
+        val d3 = block[24 + column]
+        val d4 = block[32 + column]
+        val d5 = block[40 + column]
+        val d6 = block[48 + column]
+        val d7 = block[56 + column]
+        if ((d1 | d2 | d3 | d4 | d5 | d6 | d7) == 0) {
+            val dc = block[column] << 2
+            for (row in 0 until 8) work[row * 8 + column] = dc
+        } else {
+            var z1 = (d2 + d6) * fix0541196100
+            val even2 = z1 - d6 * fix1847759065
+            val even3 = z1 + d2 * fix0765366865
+            val even0 = (block[column] + d4) << 13
+            val even1 = (block[column] - d4) << 13
+            val tmp10 = even0 + even3
+            val tmp13 = even0 - even3
+            val tmp11 = even1 + even2
+            val tmp12 = even1 - even2
+            z1 = d7 + d1
+            var z2 = d5 + d3
+            var z3 = d7 + d3
+            var z4 = d5 + d1
+            val z5 = (z3 + z4) * fix1175875602
+            var tmp0 = d7 * fix0298631336
+            var tmp1 = d5 * fix2053119869
+            var tmp2 = d3 * fix3072711026
+            var tmp3 = d1 * fix1501321110
+            z1 = -z1 * fix0899976223
+            z2 = -z2 * fix2562915447
+            z3 = -z3 * fix1961570560 + z5
+            z4 = -z4 * fix0390180644 + z5
+            tmp0 += z1 + z3
+            tmp1 += z2 + z4
+            tmp2 += z2 + z3
+            tmp3 += z1 + z4
+            work[column] = (tmp10 + tmp3 + 1024) >> 11
+            work[56 + column] = (tmp10 - tmp3 + 1024) >> 11
+            work[8 + column] = (tmp11 + tmp2 + 1024) >> 11
+            work[48 + column] = (tmp11 - tmp2 + 1024) >> 11
+            work[16 + column] = (tmp12 + tmp1 + 1024) >> 11
+            work[40 + column] = (tmp12 - tmp1 + 1024) >> 11
+            work[24 + column] = (tmp13 + tmp0 + 1024) >> 11
+            work[32 + column] = (tmp13 - tmp0 + 1024) >> 11
+        }
+    }
+    for (row in 0 until rows) {
+        val at = row * 8
+        val target = offset + row * stride
+        val d1 = work[at + 1]
+        val d2 = work[at + 2]
+        val d3 = work[at + 3]
+        val d4 = work[at + 4]
+        val d5 = work[at + 5]
+        val d6 = work[at + 6]
+        val d7 = work[at + 7]
+        if ((d1 | d2 | d3 | d4 | d5 | d6 | d7) == 0) {
+            val value = clampSample(((work[at] + 16) >> 5) + 128)
+            for (column in 0 until columns) plane[target + column] = value
+        } else {
+            var z1 = (d2 + d6) * fix0541196100
+            val even2 = z1 - d6 * fix1847759065
+            val even3 = z1 + d2 * fix0765366865
+            val even0 = (work[at] + d4) << 13
+            val even1 = (work[at] - d4) << 13
+            val tmp10 = even0 + even3
+            val tmp13 = even0 - even3
+            val tmp11 = even1 + even2
+            val tmp12 = even1 - even2
+            z1 = d7 + d1
+            var z2 = d5 + d3
+            var z3 = d7 + d3
+            var z4 = d5 + d1
+            val z5 = (z3 + z4) * fix1175875602
+            var tmp0 = d7 * fix0298631336
+            var tmp1 = d5 * fix2053119869
+            var tmp2 = d3 * fix3072711026
+            var tmp3 = d1 * fix1501321110
+            z1 = -z1 * fix0899976223
+            z2 = -z2 * fix2562915447
+            z3 = -z3 * fix1961570560 + z5
+            z4 = -z4 * fix0390180644 + z5
+            tmp0 += z1 + z3
+            tmp1 += z2 + z4
+            tmp2 += z2 + z3
+            tmp3 += z1 + z4
+            // 18 bits of scale, rounded, then centred on 128.
+            if (columns == 8) {
+                plane[target] = clampSample(((tmp10 + tmp3 + 131072) >> 18) + 128)
+                plane[target + 7] = clampSample(((tmp10 - tmp3 + 131072) >> 18) + 128)
+                plane[target + 1] = clampSample(((tmp11 + tmp2 + 131072) >> 18) + 128)
+                plane[target + 6] = clampSample(((tmp11 - tmp2 + 131072) >> 18) + 128)
+                plane[target + 2] = clampSample(((tmp12 + tmp1 + 131072) >> 18) + 128)
+                plane[target + 5] = clampSample(((tmp12 - tmp1 + 131072) >> 18) + 128)
+                plane[target + 3] = clampSample(((tmp13 + tmp0 + 131072) >> 18) + 128)
+                plane[target + 4] = clampSample(((tmp13 - tmp0 + 131072) >> 18) + 128)
+            } else {
+                val values = [tmp10 + tmp3, tmp11 + tmp2, tmp12 + tmp1, tmp13 + tmp0, tmp13 - tmp0, tmp12 - tmp1, tmp11 - tmp2, tmp10 - tmp3]
+                for (column in 0 until columns) plane[target + column] = clampSample(((values[column] + 131072) >> 18) + 128)
+            }
+        }
+    }
+}
+
+private fun failed(error: string): QrImageResult = QrImageResult(false, error, null)
+
+private fun u16At(data: string, at: int): int = (data[at] << 8) | data[at + 1]
+
+private fun copyOf(values: array<int>): array<int> {
+    val out = filledArray(values.size, 0)
+    for (index in 0 until values.size) out[index] = values[index]
+    out
+}
+
+// The rest of a sequential block after its DC: AC coefficients, dequantized,
+// into `block` in natural order.
+private fun sequentialAc(var reader: JpegBits, ac: JpegHuffman, quant: array<int>, var block: array<int>): bool {
+    for (index in 1 until 64) block[index] = 0
+    var k = 1
+    while (k < 64) {
+        val symbol = decodeSymbol(reader, ac)
+        if (symbol < 0) return false
+        val bits = symbol & 15
+        val run = symbol >>> 4
+        if (bits == 0) {
+            if (run != 15) return true
+            k += 16
+        } else {
+            k += run
+            if (k > 63) return false
+            val at = zigzag[k]
+            block[at] = receiveExtend(reader, bits) * quant[at]
+            k += 1
+        }
+    }
+    true
+}
+
+// How many more blocks of a progressive AC scan have nothing left in the band.
+private class JpegBands(var count: int)
+
+private fun acFirst(var reader: JpegBits, ac: JpegHuffman, var coefficients: array<i16>, base: int, start: int, end: int, low: int, var bands: JpegBands): bool {
+    if (bands.count > 0) {
+        bands.count -= 1
+        return true
+    }
+    var k = start
+    while (k <= end) {
+        val symbol = decodeSymbol(reader, ac)
+        if (symbol < 0) return false
+        val bits = symbol & 15
+        val run = symbol >>> 4
+        if (bits == 0) {
+            if (run < 15) {
+                bands.count = (1 << run) - 1
+                if (run > 0) bands.count += reader.take(run)
+                return true
+            }
+            k += 16
+        } else {
+            k += run
+            if (k > 63) return false
+            coefficients[base + zigzag[k]] = i16(receiveExtend(reader, bits) * (1 << low))
+            k += 1
+        }
+    }
+    true
+}
+
+private fun refineBit(var reader: JpegBits, var coefficients: array<i16>, at: int, bit: int) {
+    val value = int(coefficients[at])
+    if (reader.take(1) == 1 && (value & bit) == 0)
+        coefficients[at] = i16(if (value >= 0) value + bit else value - bit)
+}
+
+// A refinement scan: one more bit of every coefficient already nonzero, and
+// new coefficients of magnitude one.
+private fun acRefine(var reader: JpegBits, ac: JpegHuffman, var coefficients: array<i16>, base: int, start: int, end: int, low: int, var bands: JpegBands): bool {
+    val bit = 1 << low
+    var k = start
+    if (bands.count > 0) {
+        bands.count -= 1
+        while (k <= end) {
+            val at = base + zigzag[k]
+            if (coefficients[at] != i16(0)) refineBit(reader, coefficients, at, bit)
+            k += 1
+        }
+        return true
+    }
+    while (k <= end) {
+        val symbol = decodeSymbol(reader, ac)
+        if (symbol < 0) return false
+        val bits = symbol & 15
+        var run = symbol >>> 4
+        var value = 0
+        if (bits == 0) {
+            if (run < 15) {
+                bands.count = (1 << run) - 1
+                if (run > 0) bands.count += reader.take(run)
+                run = 64
+            }
+        } else {
+            if (bits != 1) return false
+            value = if (reader.take(1) == 1) bit else -bit
+        }
+        var placed = false
+        while (k <= end && !placed) {
+            val at = base + zigzag[k]
+            k += 1
+            if (coefficients[at] != i16(0)) {
+                refineBit(reader, coefficients, at, bit)
+            } else if (run == 0) {
+                coefficients[at] = i16(value)
+                placed = true
+            } else {
+                run -= 1
+            }
+        }
+    }
+    true
+}
+
+private fun dequantize(coefficients: array<i16>, base: int, quant: array<int>, var block: array<int>) {
+    for (index in 0 until 64) block[index] = int(coefficients[base + index]) * quant[index]
+}
+
+private class JpegDecoder(
+    val data: string,
+    val maxPixels: int,
+    var width: int,
+    var height: int,
+    var progressive: bool,
+    var components: array<JpegComponent>,
+    var hMax: int,
+    var vMax: int,
+    var restartInterval: int,
+    var dcTables: array<JpegHuffman>,
+    var acTables: array<JpegHuffman>,
+    var quantTables: array<array<int>>,
+    var adobeTransform: int,
+    var bands: JpegBands,
+    var scans: int,
+    var block: array<int>,
+    var work: array<int>
+) {
+    fun readTables(at: int, end: int, huffman: bool): bool {
+        var cursor = at
+        while (cursor < end) {
+            val kind = this.data[cursor] >>> 4
+            val slot = this.data[cursor] & 15
+            if (slot > 3) return false
+            if (huffman) {
+                if (kind > 1 || cursor + 17 > end) return false
+                val counts = filledArray(16, 0)
+                var total = 0
+                for (length in 0 until 16) {
+                    counts[length] = this.data[cursor + 1 + length]
+                    total += counts[length]
+                }
+                if (total > 256 || cursor + 17 + total > end) return false
+                val values = filledArray(total, 0)
+                for (index in 0 until total) values[index] = this.data[cursor + 17 + index]
+                val table = buildHuffman(counts, values)
+                if (table == null) return false
+                if (kind == 0) this.dcTables[slot] = table else this.acTables[slot] = table
+                cursor += 17 + total
+            } else {
+                if (kind > 1) return false
+                val size = if (kind == 0) 64 else 128
+                if (cursor + 1 + size > end) return false
+                val table = filledArray(64, 0)
+                for (index in 0 until 64) {
+                    table[zigzag[index]] = if (kind == 0) this.data[cursor + 1 + index] else u16At(this.data, cursor + 1 + index * 2)
+                }
+                this.quantTables[slot] = table
+                cursor += 1 + size
+            }
+        }
+        true
+    }
+
+    fun readFrame(at: int, end: int): string {
+        if (this.components.size > 0) return "bad_frame"
+        if (end - at < 6) return "bad_frame"
+        val precision = this.data[at]
+        if (precision == 12) return "unsupported_12_bit"
+        if (precision != 8) return "bad_frame"
+        this.height = u16At(this.data, at + 1)
+        this.width = u16At(this.data, at + 3)
+        val count = this.data[at + 5]
+        if (end - at != 6 + count * 3) return "bad_frame"
+        if (count != 1 && count != 3 && count != 4) return "unsupported_components"
+        if (this.height == 0) return "unsupported_dnl"
+        if (this.width == 0) return "bad_frame"
+        if (this.width > this.maxPixels / this.height) return "too_large"
+        for (index in 0 until count) {
+            val sampling = this.data[at + 7 + index * 3]
+            val h = sampling >>> 4
+            val v = sampling & 15
+            if (h < 1 || h > 4 || v < 1 || v > 4 || this.data[at + 8 + index * 3] > 3) return "bad_frame"
+            if (h > this.hMax) this.hMax = h
+            if (v > this.vMax) this.vMax = v
+        }
+        for (index in 0 until count) {
+            val base = at + 6 + index * 3
+            val id = this.data[base]
+            for (other in this.components) if (other.id == id) return "bad_frame"
+            val h = this.data[base + 1] >>> 4
+            val v = this.data[base + 1] & 15
+            val componentWidth = (this.width * h + this.hMax - 1) / this.hMax
+            val componentHeight = (this.height * v + this.vMax - 1) / this.vMax
+            this.components.append(JpegComponent(id, h, v, this.data[base + 2], componentWidth, componentHeight,
+                (componentWidth + 7) / 8, (componentHeight + 7) / 8, false, array<int>(), 0, 0, 0, array<u8>(), array<i16>()))
+        }
+        ""
+    }
+
+    // Marks the components gray needs and makes room for them.
+    fun prepare(): string {
+        val count = this.components.size
+        val rgb = count == 3 && (this.adobeTransform == 0 ||
+            (this.adobeTransform < 0 && this.components[0].id == 82 && this.components[1].id == 71 && this.components[2].id == 66))
+        for (index in 0 until count) {
+            this.components[index].needed = if (count == 1 || index == 0) true
+                else if (count == 3) rgb
+                else if (this.adobeTransform == 2) index == 3
+                else true
+        }
+        // Planes hold the image's own samples. Progressive files also keep
+        // every coefficient, two bytes for each sample of the padded blocks.
+        for (index in 0 until count) {
+            if (this.components[index].needed) {
+                val blocks = this.components[index].blocksPerLine * this.components[index].blocksPerColumn
+                if (blocks > (this.maxPixels * 2 + 65536) / 64) return "too_large"
+                this.components[index].plane = filledArray(this.components[index].width * this.components[index].height, u8(0))
+                if (this.progressive) this.components[index].coefficients = filledArray(blocks * 64, i16(0))
+            }
+        }
+        ""
+    }
+
+    fun onlyFirst(): bool {
+        var only = true
+        for (index in 1 until this.components.size) if (this.components[index].needed) only = false
+        only && this.components[0].width == this.width && this.components[0].height == this.height
+    }
+
+    // Gray from the decoded planes, when that is more than the first plane.
+    fun gray(): array<u8> {
+        val count = this.components.size
+        val width = this.width
+        val height = this.height
+        val pixels = filledArray(width * height, u8(0))
+        val rgb = count == 3 && this.components[1].needed
+        val ycck = count == 4 && !this.components[1].needed
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val value = if (rgb) qrLuma(this.sample(0, x, y), this.sample(1, x, y), this.sample(2, x, y), 255)
+                    else if (ycck) (255 - this.sample(0, x, y)) * this.sample(3, x, y) / 255
+                    else if (count == 4) {
+                        // Adobe CMYK is stored inverted: 255 is no ink.
+                        val k = this.sample(3, x, y)
+                        qrLuma(this.sample(0, x, y) * k / 255, this.sample(1, x, y) * k / 255, this.sample(2, x, y) * k / 255, 255)
+                    }
+                    else this.sample(0, x, y)
+                pixels[y * width + x] = u8(value)
+            }
+        }
+        pixels
+    }
+
+    fun sample(index: int, x: int, y: int): int {
+        val component = this.components[index]
+        val column = x * component.h / this.hMax
+        val row = y * component.v / this.vMax
+        int(component.plane[row * component.width + column])
+    }
+
+    // Decodes one scan whose header is at `at` to `end`. "skip" when gray
+    // needs nothing from it.
+    fun readScan(at: int, end: int): string {
+        if (end - at < 1) return "bad_scan"
+        val count = this.data[at]
+        if (count < 1 || count > 4 || end - at != 4 + count * 2) return "bad_scan"
+        val inScan: array<int> = []
+        var blocksPerMcu = 0
+        var anyNeeded = false
+        for (index in 0 until count) {
+            val id = this.data[at + 1 + index * 2]
+            val tables = this.data[at + 2 + index * 2]
+            var found = -1
+            for (candidate in 0 until this.components.size) if (this.components[candidate].id == id) found = candidate
+            if (found < 0) return "bad_scan"
+            for (other in inScan) if (other == found) return "bad_scan"
+            if ((tables >>> 4) > 3 || (tables & 15) > 3) return "bad_scan"
+            this.components[found].dcTable = tables >>> 4
+            this.components[found].acTable = tables & 15
+            if (this.components[found].quant.size == 0) {
+                val table = this.quantTables[this.components[found].quantTable]
+                if (table.size != 64) return "missing_table"
+                this.components[found].quant = copyOf(table)
+            }
+            inScan.append(found)
+            blocksPerMcu += this.components[found].h * this.components[found].v
+            if (this.components[found].needed) anyNeeded = true
+        }
+        if (count > 1 && blocksPerMcu > 10) return "bad_scan"
+        val start = this.data[at + 1 + count * 2]
+        val last = this.data[at + 2 + count * 2]
+        val high = this.data[at + 3 + count * 2] >>> 4
+        val low = this.data[at + 3 + count * 2] & 15
+        this.scans += 1
+        if (this.scans > 64) return "too_many_scans"
+        val reader = JpegBits(this.data, end, 0, 0, 0, false)
+        if (!this.progressive) {
+            if (!anyNeeded) return "skip"
+            for (index in inScan) {
+                if (!this.dcTables[this.components[index].dcTable].defined || !this.acTables[this.components[index].acTable].defined) return "missing_table"
+            }
+            return this.decodeScan(reader, inScan, 0, 63, 0, 0)
+        }
+        if (last > 63 || start > last || high > 13 || low > 13) return "bad_scan"
+        if (start == 0 && last != 0) return "bad_scan"
+        if (start > 0 && count != 1) return "bad_scan"
+        if (start > 0 && !anyNeeded) return "skip"
+        for (index in inScan) {
+            if (start == 0 && high == 0 && !this.dcTables[this.components[index].dcTable].defined) return "missing_table"
+            if (start > 0 && !this.acTables[this.components[index].acTable].defined) return "missing_table"
+        }
+        this.decodeScan(reader, inScan, start, last, high, low)
+    }
+
+    fun mcusPerLine(): int = (this.width + 8 * this.hMax - 1) / (8 * this.hMax)
+
+    // MCUs are the blocks of each component in turn when interleaved, and
+    // single blocks over the component's own size when not.
+    fun decodeScan(var reader: JpegBits, inScan: array<int>, start: int, last: int, high: int, low: int): string {
+        for (index in inScan) this.components[index].predictor = 0
+        this.bands.count = 0
+        val single = inScan.size == 1
+        val perLine = if (single) this.components[inScan[0]].blocksPerLine else this.mcusPerLine()
+        val total = if (single) perLine * this.components[inScan[0]].blocksPerColumn
+            else perLine * ((this.height + 8 * this.vMax - 1) / (8 * this.vMax))
+        for (mcu in 0 until total) {
+            if (this.restartInterval > 0 && mcu > 0 && mcu % this.restartInterval == 0) {
+                if (!reader.restart()) return if (reader.at >= this.data.size) "truncated" else "bad_restart"
+                for (index in inScan) this.components[index].predictor = 0
+                this.bands.count = 0
+            }
+            val mcuRow = mcu / perLine
+            val mcuColumn = mcu % perLine
+            if (single) {
+                if (!this.decodeBlock(reader, inScan[0], mcuRow, mcuColumn, start, last, high, low)) return "bad_data"
+            } else {
+                for (index in inScan) {
+                    val h = this.components[index].h
+                    val v = this.components[index].v
+                    for (y in 0 until v) {
+                        for (x in 0 until h) {
+                            if (!this.decodeBlock(reader, index, mcuRow * v + y, mcuColumn * h + x, start, last, high, low)) return "bad_data"
+                        }
+                    }
+                }
+            }
+            if (reader.padded > 64) return "truncated"
+        }
+        ""
+    }
+
+    // One block. Blocks outside the component, padding of whole MCUs, are
+    // decoded and dropped, as are those of components gray doesn't need.
+    fun decodeBlock(var reader: JpegBits, index: int, row: int, column: int, start: int, last: int, high: int, low: int): bool {
+        val keep = this.components[index].needed && row < this.components[index].blocksPerColumn && column < this.components[index].blocksPerLine
+        if (start == 0 && high == 0) {
+            val size = decodeSymbol(reader, this.dcTables[this.components[index].dcTable])
+            if (size < 0 || size > 15) return false
+            this.components[index].predictor += receiveExtend(reader, size)
+        }
+        if (!this.progressive) {
+            if (!sequentialAc(reader, this.acTables[this.components[index].acTable], this.components[index].quant, this.block)) return false
+            if (keep) {
+                this.block[0] = this.components[index].predictor * this.components[index].quant[0]
+                val width = this.components[index].width
+                val columns = if (width - column * 8 < 8) width - column * 8 else 8
+                val rows = if (this.components[index].height - row * 8 < 8) this.components[index].height - row * 8 else 8
+                inverseDct(this.block, this.work, this.components[index].plane, row * 8 * width + column * 8, width, columns, rows)
+            }
+            return true
+        }
+        val base = (row * this.components[index].blocksPerLine + column) * 64
+        if (start == 0) {
+            if (high == 0) {
+                if (keep) this.components[index].coefficients[base] = i16(this.components[index].predictor << low)
+            } else {
+                if (reader.take(1) == 1 && keep)
+                    this.components[index].coefficients[base] = i16(int(this.components[index].coefficients[base]) | (1 << low))
+            }
+            return true
+        }
+        if (!keep) return false
+        if (high == 0) return acFirst(reader, this.acTables[this.components[index].acTable], this.components[index].coefficients, base, start, last, low, this.bands)
+        acRefine(reader, this.acTables[this.components[index].acTable], this.components[index].coefficients, base, start, last, low, this.bands)
+    }
+
+    // After the last scan of a progressive file: dequantize and transform.
+    fun finishProgressive() {
+        for (index in 0 until this.components.size) {
+            if (this.components[index].needed && this.components[index].quant.size == 64) {
+                val width = this.components[index].width
+                val height = this.components[index].height
+                for (row in 0 until this.components[index].blocksPerColumn) {
+                    for (column in 0 until this.components[index].blocksPerLine) {
+                        val base = (row * this.components[index].blocksPerLine + column) * 64
+                        dequantize(this.components[index].coefficients, base, this.components[index].quant, this.block)
+                        val columns = if (width - column * 8 < 8) width - column * 8 else 8
+                        val rows = if (height - row * 8 < 8) height - row * 8 else 8
+                        inverseDct(this.block, this.work, this.components[index].plane, row * 8 * width + column * 8, width, columns, rows)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Decodes a JPEG file to gray: baseline, extended sequential and progressive
+// with Huffman coding, any sampling factors, restart intervals and 8- or 16-bit
+// quantization tables. Gray, YCbCr, RGB and Adobe CMYK or YCCK files. Refuses
+// arithmetic coding, 12-bit samples, lossless and hierarchical files. EXIF
+// orientation is not applied.
+fun qrJpegDecode(bytes: string, maxPixels: int = qrMaxImagePixels): QrImageResult {
+    if (bytes.size < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8) return failed("not_jpeg")
+    val emptyQuant: array<array<int>> = [array<int>(), array<int>(), array<int>(), array<int>()]
+    val decoder = JpegDecoder(bytes, maxPixels, 0, 0, false, array<JpegComponent>(), 1, 1, 0,
+        [emptyHuffman(), emptyHuffman(), emptyHuffman(), emptyHuffman()],
+        [emptyHuffman(), emptyHuffman(), emptyHuffman(), emptyHuffman()],
+        emptyQuant, -1, JpegBands(0), 0, filledArray(64, 0), filledArray(64, 0))
+    var at = 2
+    var prepared = false
+    var decodedScan = false
+    while (true) {
+        at = jpegNextMarker(bytes, at)
+        if (at + 1 >= bytes.size) {
+            // Some files lose their EOI; what was decoded still counts.
+            if (decodedScan) break
+            return failed("truncated")
+        }
+        val marker = bytes[at + 1]
+        at += 2
+        if (marker == 0xD9) break
+        if (marker == 0xD8) return failed("bad_marker")
+        if ((marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) continue
+        if (at + 2 > bytes.size) return failed("truncated")
+        val length = u16At(bytes, at)
+        if (length < 2 || at + length > bytes.size) return failed("truncated")
+        val body = at + 2
+        val end = at + length
+        if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+            decoder.progressive = marker == 0xC2
+            val error = decoder.readFrame(body, end)
+            if (error.size > 0) return failed(error)
+        } else if (marker == 0xC3) {
+            return failed("unsupported_lossless")
+        } else if (marker == 0xC5 || marker == 0xC6 || marker == 0xC7) {
+            return failed("unsupported_hierarchical")
+        } else if (marker >= 0xC9 && marker <= 0xCF) {
+            return failed("unsupported_arithmetic")
+        } else if (marker == 0xC4) {
+            if (!decoder.readTables(body, end, true)) return failed("bad_table")
+        } else if (marker == 0xDB) {
+            if (!decoder.readTables(body, end, false)) return failed("bad_table")
+        } else if (marker == 0xDD) {
+            if (length != 4) return failed("bad_marker")
+            decoder.restartInterval = u16At(bytes, body)
+        } else if (marker == 0xEE) {
+            // Adobe's APP14 says whether three or four components are transformed.
+            if (length >= 14 && bytes.slice(body, body + 5) == "Adobe") decoder.adobeTransform = bytes[body + 11]
+        } else if (marker == 0xDA) {
+            if (decoder.components.size == 0) return failed("bad_scan")
+            if (!prepared) {
+                val error = decoder.prepare()
+                if (error.size > 0) return failed(error)
+                prepared = true
+            }
+            val error = decoder.readScan(body, end)
+            if (error != "" && error != "skip") return failed(error)
+            if (error == "") decodedScan = true
+        }
+        at = end
+    }
+    if (decoder.components.size == 0) return failed("no_frame")
+    if (!decodedScan) return failed("no_data")
+    if (decoder.progressive) decoder.finishProgressive()
+    if (decoder.onlyFirst()) return QrImageResult(true, "", QrImage(decoder.width, decoder.height, decoder.components[0].plane))
+    QrImageResult(true, "", QrImage(decoder.width, decoder.height, decoder.gray()))
+}
+
+// Whether the bytes start like a JPEG file.
+fun qrIsJpeg(bytes: string): bool = bytes.size >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
