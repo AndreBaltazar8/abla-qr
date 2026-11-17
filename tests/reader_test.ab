@@ -4,6 +4,12 @@ import "abla/bytes"
 import "abla/math"
 import "support.ab"
 import "../src/qr.ab"
+import "../src/image.ab"
+import "../src/tables.ab"
+import "../src/reader.ab"
+import "../src/render.ab"
+import "../src/encode.ab"
+import "abla/text"
 
 private val payload = "https://example.com/reader?test=1"
 

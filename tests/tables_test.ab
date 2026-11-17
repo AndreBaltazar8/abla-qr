@@ -1,5 +1,6 @@
 import "abla/test"
 import "../src/qr.ab"
+import "../src/tables.ab"
 
 private fun listText(values: array<int>): string {
     var out = ""

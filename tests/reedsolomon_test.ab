@@ -1,6 +1,7 @@
 import "abla/test"
 import "support.ab"
 import "../src/qr.ab"
+import "../src/reedsolomon.ab"
 
 private fun listText(values: array<int>): string {
     var out = ""

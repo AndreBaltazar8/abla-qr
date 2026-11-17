@@ -4,6 +4,10 @@ import "abla/bytes"
 import "abla/fs"
 import "support.ab"
 import "../src/qr.ab"
+import "../src/image.ab"
+import "../src/png.ab"
+import "../src/encode.ab"
+import "../src/render.ab"
 
 private fun fromHex(hex: string): string {
     val out = byteBuffer()

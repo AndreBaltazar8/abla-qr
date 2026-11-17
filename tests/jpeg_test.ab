@@ -8,6 +8,10 @@ import "abla/crypto"
 import "abla/fs"
 import "support.ab"
 import "../src/qr.ab"
+import "../src/jpeg.ab"
+import "../src/png.ab"
+import "../src/reader.ab"
+import "../src/render.ab"
 
 private fun parseInt(text: string): int {
     var value = 0

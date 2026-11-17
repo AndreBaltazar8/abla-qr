@@ -6,6 +6,9 @@ import "abla/io"
 import "abla/fs"
 import "abla/process/arguments"
 import "../src/qr.ab"
+import "../src/encode.ab"
+import "../src/tables.ab"
+import "../src/render.ab"
 
 fun main: int {
     val data = if (processArgumentCount() > 0) processArgument(0) else "https://example.com"

@@ -1,6 +1,11 @@
 import "abla/test"
 import "abla/text"
 import "../src/qr.ab"
+import "../src/render.ab"
+import "../src/png.ab"
+import "../src/matrix.ab"
+import "../src/encode.ab"
+import "../src/image.ab"
 
 private fun encoded(text: string): QrMatrix? = qrEncode(text).matrix
 

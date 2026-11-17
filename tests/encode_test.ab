@@ -2,6 +2,9 @@ import "abla/test"
 import "abla/text"
 import "support.ab"
 import "../src/qr.ab"
+import "../src/matrix.ab"
+import "../src/tables.ab"
+import "../src/encode.ab"
 
 private fun textOf(result: QrEncodeResult): string {
     val matrix = result.matrix

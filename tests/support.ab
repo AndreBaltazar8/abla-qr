@@ -3,6 +3,9 @@
 import "abla/float"
 import "abla/math"
 import "../src/qr.ab"
+import "../src/encode.ab"
+import "../src/matrix.ab"
+import "../src/image.ab"
 
 // A small deterministic generator, so a failure repeats.
 class TestRandom(var state: int) {

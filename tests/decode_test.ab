@@ -3,6 +3,10 @@ import "abla/bytes"
 import "abla/text"
 import "support.ab"
 import "../src/qr.ab"
+import "../src/tables.ab"
+import "../src/matrix.ab"
+import "../src/encode.ab"
+import "../src/decode.ab"
 
 private fun readBack(matrix: QrMatrix): string {
     val result = qrDecodeMatrix(matrix)

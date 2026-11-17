@@ -7,6 +7,9 @@ import "abla/fs"
 import "abla/float/text"
 import "abla/process/arguments"
 import "../src/qr.ab"
+import "../src/png.ab"
+import "../src/reader.ab"
+import "../src/tables.ab"
 
 fun main: int {
     if (processArgumentCount() < 1) {

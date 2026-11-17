@@ -7,6 +7,7 @@ import "abla/text"
 import "abla/crypto"
 import "abla/fs"
 import "../src/qr.ab"
+import "../src/reader.ab"
 
 fun main: int {
     val folder = "tests/fixtures/photo-style/"

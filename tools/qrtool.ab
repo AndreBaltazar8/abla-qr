@@ -9,6 +9,11 @@ import "abla/io"
 import "abla/fs"
 import "abla/process/arguments"
 import "../src/qr.ab"
+import "../src/tables.ab"
+import "../src/encode.ab"
+import "../src/render.ab"
+import "../src/matrix.ab"
+import "../src/reader.ab"
 
 private fun parseInt(text: string): int {
     var value = 0
