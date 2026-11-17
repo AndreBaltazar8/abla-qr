@@ -121,17 +121,20 @@ this library's codes in each layout (sampling, progressive, restart markers,
 quality 12 to 90, EXIF, RGB, CMYK); their gray must equal libjpeg's, or for RGB
 and CMYK come within 2 of it, and their code must read.
 
-`make interop` checks against independent implementations, from Nix:
+`make test` compares the encoder with two others, bit for bit: `tests/reference_test.ab` holds the module
+matrices segno (alphanumeric payloads) and python-qrcode (byte payloads) made for all 160 versions and levels, and for every
+mask on nine versions (`tests/reference/README.md` says how).
 
-- Module matrices equal another encoder's, bit for bit, for all 160 versions and
-  levels (segno for alphanumeric, python-qrcode for byte) and every mask on nine versions.
-- zbar and ZXing read all 160 from PNG, and zbar from SVG.
-- The reader reads codes made by python-qrcode, segno and qrencode, including
-  Kanji, ECI and structured append.
-- It reads 160 **synthesized** images, with 28 harder ones measured but not required (`tools/make_fixtures.py`): rotation,
-  perspective, skew, curved paper, blur, noise, uneven light, JPEG artifacts,
-  damage. These imitate photographs but aren't photographs, and no real camera
-  shots are in the suite. A table compares zbar and ZXing on the same images.
+`make interop` checks against independent implementations, from Nix (zbar and librsvg):
+
+- zbar reads all 160 codes this library creates from PNG, and from SVG (rendered by rsvg-convert). ZXing, which this check
+  once also ran, has no command line tool in nixpkgs and is not run any more.
+- The reader reads codes made by python-qrcode, segno and qrencode, including Kanji, ECI and structured append (35 images
+  committed in `tests/interop/other-encoders`, made once by those tools).
+- It reads 153 **synthesized** images, with 28 harder ones measured but not required (`tools/make-fixtures.ab`, seeded, so the
+  images are the same every run): rotation, perspective, skew, curved paper, blur, noise, uneven light, JPEG-like block
+  artifacts, damage. These imitate photographs but aren't photographs, and no real camera shots are in the suite. A table
+  compares zbar on the same images.
 
 ## License
 

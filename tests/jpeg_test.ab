@@ -1,5 +1,5 @@
 // JPEG decoding against libjpeg's output, the committed files' codes, and
-// hostile input. The fixtures come from tools/make_jpeg_fixtures.py.
+// hostile input. The fixtures were made once by tools/make_jpeg_fixtures.py (git show 1ecd437:tools/make_jpeg_fixtures.py), since removed.
 
 import "abla/test"
 import "abla/text"

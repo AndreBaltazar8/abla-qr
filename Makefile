@@ -9,7 +9,7 @@ INTEROP_DIR := $(BUILD_DIR)/interop-fixtures
 # cases can exceed what the level corrects.
 ALLOWED := damaged=2 stress-blur=3 stress-curved=3 stress-damage=4 stress-perspective=12 stress-small=6
 
-.PHONY: test test-in-shell examples interop interop-in-shell fixtures clean
+.PHONY: test test-in-shell examples interop interop-programs interop-in-shell clean
 
 test:
 	@if [ -n "$$IN_NIX_SHELL" ]; then \
@@ -30,18 +30,20 @@ examples:
 	$(BUILD_DIR)/read-code $(BUILD_DIR)/example.png | grep -q "abla-qr example"
 
 interop: examples
+	nix-shell $(NIXPKGS_IMPORT) $(ABLAC_DIR)/shell.nix --run '$(MAKE) interop-programs'
 	nix-shell $(NIXPKGS_IMPORT) tools/interop-shell.nix --run '$(MAKE) interop-in-shell'
 
-interop-in-shell:
-	python3 tools/interop_create.py $(BUILD_DIR)/qrtool
-	python3 tools/make_fixtures.py $(INTEROP_DIR)
-	python3 tools/interop_read.py $(BUILD_DIR)/qrtool $(INTEROP_DIR) $(ALLOWED)
+# The inputs of the interoperability checks, made by Abla programs.
+interop-programs:
+	$(COMPILER) build tools/interop-payloads.ab -o $(BUILD_DIR)/interop-payloads
+	$(BUILD_DIR)/interop-payloads $(BUILD_DIR)/interop-payload-files
+	$(COMPILER) build tools/make-fixtures.ab -o $(BUILD_DIR)/make-fixtures
+	$(BUILD_DIR)/make-fixtures $(INTEROP_DIR)
 
-fixtures:
-	python3 tools/make_png_fixtures.py tests/fixtures/png
-	nix-shell $(NIXPKGS_IMPORT) tools/interop-shell.nix --run \
-		'python3 tools/make_fixtures.py tests/fixtures/photo-style --small && \
-		python3 tools/make_jpeg_fixtures.py $(BUILD_DIR)/qrtool tests/fixtures/jpeg'
+# zbar and rsvg-convert read what qrtool wrote; qrtool reads the fixtures.
+interop-in-shell:
+	bash tools/interop-create.sh $(BUILD_DIR)/qrtool $(BUILD_DIR)/interop-payload-files
+	bash tools/interop-read.sh $(BUILD_DIR)/qrtool '$(INTEROP_DIR) tests/interop/other-encoders' $(ALLOWED)
 
 clean:
 	@if [ -d "$(BUILD_DIR)" ]; then gio trash "$(BUILD_DIR)"; fi

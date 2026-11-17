@@ -1,0 +1,32 @@
+// Writes the payload of every version and level of tests/reference/matrices.tsv.z to a directory, one file each
+// (v7-Q.bin), for tools/interop-create.sh to encode with qrtool and read back with zbar:
+//   interop-payloads <directory>
+import "abla/crypto"
+import "abla/fs"
+import "abla/io"
+import "abla/bytes"
+import "../src/png.ab"
+import "abla/process"
+import "abla/text"
+
+fun main: int {
+    val directory = processArgument(0)
+    Path(directory).createDirectories()
+    val inflated = qrZlibInflate(Path("tests/reference/matrices.tsv.z").readText(), 64 * 1024 * 1024)
+    if (inflated == null) return 1
+    val unpacked = byteBuffer()
+    for (byte in inflated) unpacked.appendByteValue(int(byte))
+    var written = 0
+    for (line in unpacked.toText().split("\n")) {
+        if (line.size > 0) {
+            val fields = line.split("\t")
+            val name = "$directory/v${fields[0]}-${fields[1]}.bin"
+            if (!Path(name).exists()) {
+                Path(name).writeText(hexDecode(fields[4]))
+                written = written + 1
+            }
+        }
+    }
+    println("$written payloads")
+    0
+}

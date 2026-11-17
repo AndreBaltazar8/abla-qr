@@ -1,5 +1,5 @@
 // Reads the fixtures committed under tests/fixtures/photo-style. They are
-// synthesized by tools/make_fixtures.py, not photographs: codes from other
+// synthesized once by tools/make_fixtures.py (git show 1ecd437:tools/make_fixtures.py), not photographs: codes from other
 // encoders put through imitations of what a camera does.
 
 import "abla/test"

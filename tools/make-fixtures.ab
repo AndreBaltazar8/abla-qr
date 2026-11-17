@@ -1,0 +1,608 @@
+// Synthesizes reader fixtures: codes put through transforms that imitate what a camera does (rotation, perspective, shear, blur,
+// sensor noise, uneven light, JPEG-like block artifacts, curved paper, damage). They are synthesized, not photographs, and
+// deterministic for a seed:
+//
+//   make-fixtures OUTPUT_DIR
+//
+// writes PNG files and a manifest.tsv of `file<TAB>category<TAB>hex of the data` (the format tools/interop-read.sh and
+// tests/fixtures_test.ab read). The base codes are made by this library: tests/reference_test.ab proves its matrices equal
+// segno's and python-qrcode's bit for bit, so they are what those encoders made. The codes that other encoders (qrencode, segno,
+// python-qrcode) made, and the modes this library cannot create, are committed in tests/interop/other-encoders.
+import "abla/bytes"
+import "abla/compression/gzip"
+import "abla/crypto"
+import "abla/float"
+import "abla/fs"
+import "abla/io"
+import "abla/math"
+import "abla/process"
+import "abla/text"
+import "../src/qr.ab"
+import "../src/encode.ab"
+import "../src/matrix.ab"
+import "../src/png.ab"
+
+class Rng(var state: int) {
+    fun next(limit: int): int {
+        this.state = (this.state * 6364136223846793005 + 1442695040888963407)
+        ((this.state >>> 33) & 0x7FFFFFFF) % limit
+    }
+    // Uniform in [low, high).
+    fun uniform(low: f64, high: f64): f64 = low + (high - low) * f64FromInt(this.next(1000000)) / 1000000.0
+    // Normal, by Box-Muller.
+    fun normal(mean: f64, sigma: f64): f64 {
+        val u = (f64FromInt(this.next(1000000)) + 1.0) / 1000001.0
+        val v = f64FromInt(this.next(1000000)) / 1000000.0
+        mean + sigma * sqrt(-2.0 * log(u)) * cos(6.283185307179586 * v)
+    }
+}
+
+class Gray(val width: int, val height: int, val pixels: array<f64>)
+
+fun copyOf(image: Gray): Gray {
+    val pixels: array<f64> = []
+    for (value in image.pixels) pixels.append(value)
+    Gray(image.width, image.height, pixels)
+}
+
+fun grayFilled(width: int, height: int, value: f64): Gray = Gray(width, height, filledArray(width * height, value))
+
+fun clamp255(value: f64): f64 = if (value < 0.0) 0.0 else if (value > 255.0) 255.0 else value
+
+fun TEXTS(): array<string> = [
+    "https://example.com/menu?table=12",
+    "WIFI:T:WPA;S:cafe;P:correct horse battery;;",
+    "Olá, código de barras! Preço: 12,50 €",
+    "HTTPS://EXAMPLE.ORG/A/B/C",
+    "A:123456789*B:999999990*C:PT*D:FT*E:N*F:20261031*G:FT 2026/1*H:ABCD-1*I1:PT*I7:100.00*I8:23.00*N:23.00*O:123.00*Q:wJal*R:9999",
+    "1234567890123456789012345",
+    "BEGIN:VCARD\nVERSION:3.0\nFN:Ada Lovelace\nTEL:+351210000000\nEMAIL:ada@example.com\nEND:VCARD\n",
+    "x".repeat(300),
+    "Long text. ".repeat(90)
+]
+
+fun levelOf(name: string): QrErrorCorrection =
+    if (name == "L") qrEcLow else if (name == "Q") qrEcQuartile else if (name == "H") qrEcHigh else qrEcMedium
+
+// The code as python-qrcode makes its image: modules of `box` pixels, `border` modules of quiet zone, 0 dark and 255 light.
+fun codeImage(text: string, level: string, box: int, border: int = 4, version: int = 0): Gray {
+    val options = QrOptions(errorCorrection = levelOf(level), minVersion = if (version > 0) version else 1,
+        maxVersion = if (version > 0) version else 40)
+    val result = qrEncodeBytes(text, options)
+    val matrix = result.matrix
+    if (matrix == null) {
+        eprintln("cannot encode: ${result.error}")
+        exit(2)
+    }
+    val side = (matrix.size + border * 2) * box
+    val image = grayFilled(side, side, 255.0)
+    for (y in 0 until matrix.size) {
+        for (x in 0 until matrix.size) {
+            if (matrix.dark(x, y)) {
+                for (dy in 0 until box) for (dx in 0 until box) image.pixels[((y + border) * box + dy) * side + (x + border) * box + dx] = 0.0
+            }
+        }
+    }
+    image
+}
+
+// Bilinear sample with a fill outside.
+fun sample(image: Gray, x: f64, y: f64, fill: f64): f64 {
+    if (x < 0.0 || y < 0.0 || x > f64FromInt(image.width - 1) || y > f64FromInt(image.height - 1)) return fill
+    val x0 = f64ToInt(floor(x))
+    val y0 = f64ToInt(floor(y))
+    val x1 = if (x0 + 1 < image.width) x0 + 1 else x0
+    val y1 = if (y0 + 1 < image.height) y0 + 1 else y0
+    val fx = x - f64FromInt(x0)
+    val fy = y - f64FromInt(y0)
+    val top = image.pixels[y0 * image.width + x0] * (1.0 - fx) + image.pixels[y0 * image.width + x1] * fx
+    val bottom = image.pixels[y1 * image.width + x0] * (1.0 - fx) + image.pixels[y1 * image.width + x1] * fx
+    top * (1.0 - fy) + bottom * fy
+}
+
+fun gaussianBlur(image: Gray, sigma: f64): Gray {
+    val radius = f64ToInt(ceil(sigma * 3.0))
+    val kernel: array<f64> = []
+    var total = 0.0
+    for (i in -radius until radius + 1) {
+        val weight = exp(-(f64FromInt(i) * f64FromInt(i)) / (2.0 * sigma * sigma))
+        kernel.append(weight)
+        total = total + weight
+    }
+    for (i in 0 until kernel.size) kernel[i] = kernel[i] / total
+    val w = image.width
+    val h = image.height
+    val horizontal = grayFilled(w, h, 0.0)
+    for (y in 0 until h) {
+        for (x in 0 until w) {
+            var sum = 0.0
+            for (k in 0 until kernel.size) {
+                var xx = x + k - radius
+                if (xx < 0) xx = -xx
+                if (xx >= w) xx = 2 * w - 2 - xx
+                if (xx < 0) xx = 0
+                sum = sum + kernel[k] * image.pixels[y * w + xx]
+            }
+            horizontal.pixels[y * w + x] = sum
+        }
+    }
+    val out = grayFilled(w, h, 0.0)
+    for (y in 0 until h) {
+        for (x in 0 until w) {
+            var sum = 0.0
+            for (k in 0 until kernel.size) {
+                var yy = y + k - radius
+                if (yy < 0) yy = -yy
+                if (yy >= h) yy = 2 * h - 2 - yy
+                if (yy < 0) yy = 0
+                sum = sum + kernel[k] * horizontal.pixels[yy * w + x]
+            }
+            out.pixels[y * w + x] = sum
+        }
+    }
+    out
+}
+
+// The code on textured paper, with room for transforms.
+fun pasteOnBackground(var rng: Rng, code: Gray, size: int, gray: f64 = 235.0): Gray {
+    val back = grayFilled(size, size, 0.0)
+    for (i in 0 until size * size) back.pixels[i] = clamp255(rng.normal(gray, 6.0))
+    val blurred = gaussianBlur(back, 2.0)
+    val left = (size - code.width) / 2
+    val top = (size - code.height) / 2
+    for (y in 0 until code.height) for (x in 0 until code.width) blurred.pixels[(top + y) * size + left + x] = code.pixels[y * code.width + x]
+    blurred
+}
+
+// Rotates counter-clockwise by degrees about the centre; `expand` makes the canvas hold the whole result.
+fun rotate(image: Gray, degrees: f64, expand: bool, fill: f64): Gray {
+    val angle = degrees * 3.141592653589793 / 180.0
+    val c = cos(angle)
+    val s = sin(angle)
+    val w = f64FromInt(image.width)
+    val h = f64FromInt(image.height)
+    var nw = image.width
+    var nh = image.height
+    if (expand) {
+        nw = f64ToInt(ceil(fabs(w * c) + fabs(h * s)))
+        nh = f64ToInt(ceil(fabs(w * s) + fabs(h * c)))
+    }
+    val out = grayFilled(nw, nh, fill)
+    for (y in 0 until nh) {
+        for (x in 0 until nw) {
+            val dx = f64FromInt(x) + 0.5 - f64FromInt(nw) / 2.0
+            val dy = f64FromInt(y) + 0.5 - f64FromInt(nh) / 2.0
+            val sx = c * dx - s * dy + w / 2.0 - 0.5
+            val sy = s * dx + c * dy + h / 2.0 - 0.5
+            out.pixels[y * nw + x] = sample(image, sx, sy, fill)
+        }
+    }
+    out
+}
+
+// Solves an n x n system by Gaussian elimination with partial pivoting; m holds n rows of n + 1 numbers, row after row.
+fun solve(var m: array<f64>, n: int): array<f64> {
+    val width = n + 1
+    for (column in 0 until n) {
+        var pivot = column
+        for (r in column + 1 until n) if (fabs(m[r * width + column]) > fabs(m[pivot * width + column])) pivot = r
+        for (k in 0 until width) {
+            val held = m[column * width + k]
+            m[column * width + k] = m[pivot * width + k]
+            m[pivot * width + k] = held
+        }
+        for (r in column + 1 until n) {
+            val factor = m[r * width + column] / m[column * width + column]
+            for (k in column until width) m[r * width + k] = m[r * width + k] - factor * m[column * width + k]
+        }
+    }
+    val x = filledArray(n, 0.0)
+    var r = n - 1
+    while (r >= 0) {
+        var sum = m[r * width + n]
+        for (k in r + 1 until n) sum = sum - m[r * width + k] * x[k]
+        x[r] = sum / m[r * width + r]
+        r = r - 1
+    }
+    x
+}
+
+// Perspective with the corners moved by up to shift of the side: output (x, y) takes input (u, v) by the homography
+// that maps the moved corners back to the original ones.
+fun perspective(image: Gray, shift: f64, var rng: Rng, fill: f64 = 235.0): Gray {
+    val w = f64FromInt(image.width)
+    val h = f64FromInt(image.height)
+    val source: array<f64> = [0.0, 0.0, w, 0.0, w, h, 0.0, h]
+    val target: array<f64> = []
+    for (i in 0 until 4) {
+        target.append(source[2 * i] + rng.uniform(-shift, shift) * w)
+        target.append(source[2 * i + 1] + rng.uniform(-shift, shift) * h)
+    }
+    val rows: array<f64> = []
+    for (i in 0 until 4) {
+        val x = target[2 * i]
+        val y = target[2 * i + 1]
+        val u = source[2 * i]
+        val v = source[2 * i + 1]
+        for (value in [x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, u]) rows.append(value)
+        for (value in [0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v]) rows.append(value)
+    }
+    val k = solve(rows, 8)
+    val out = grayFilled(image.width, image.height, fill)
+    for (y in 0 until image.height) {
+        for (x in 0 until image.width) {
+            val fx = f64FromInt(x) + 0.5
+            val fy = f64FromInt(y) + 0.5
+            val d = k[6] * fx + k[7] * fy + 1.0
+            out.pixels[y * image.width + x] = sample(image, (k[0] * fx + k[1] * fy + k[2]) / d - 0.5, (k[3] * fx + k[4] * fy + k[5]) / d - 0.5, fill)
+        }
+    }
+    out
+}
+
+fun shear(image: Gray, xFactor: f64, yFactor: f64, fill: f64 = 235.0): Gray {
+    val w = f64FromInt(image.width)
+    val h = f64FromInt(image.height)
+    val out = grayFilled(image.width, image.height, fill)
+    for (y in 0 until image.height) {
+        for (x in 0 until image.width) {
+            val fx = f64FromInt(x)
+            val fy = f64FromInt(y)
+            out.pixels[y * image.width + x] = sample(image, fx + xFactor * fy - xFactor * h / 2.0, yFactor * fx + fy - yFactor * w / 2.0, fill)
+        }
+    }
+    out
+}
+
+// As if printed on a can: columns squeezed towards the edges, rows bowed.
+fun cylinder(image: Gray, strength: f64): Gray {
+    val w = f64FromInt(image.width)
+    val h = f64FromInt(image.height)
+    val out = grayFilled(image.width, image.height, 255.0)
+    for (y in 0 until image.height) {
+        for (x in 0 until image.width) {
+            val nx = (f64FromInt(x) - w / 2.0) / (w / 2.0)
+            val sx = w / 2.0 + (w / 2.0) * sin(nx * strength) / sin(strength)
+            val sy = f64FromInt(y) + (h * 0.06 * strength) * nx * nx * ((f64FromInt(y) - h / 2.0) / (h / 2.0))
+            out.pixels[y * image.width + x] = sample(image, sx, sy, 255.0)
+        }
+    }
+    out
+}
+
+fun unevenLight(image: Gray, var rng: Rng, depth: f64): Gray {
+    val angle = rng.uniform(0.0, 6.283185307179586)
+    val c = cos(angle)
+    val s = sin(angle)
+    val ramp = filledArray(image.width * image.height, 0.0)
+    var low = 1.0e30
+    var high = -1.0e30
+    for (y in 0 until image.height) {
+        for (x in 0 until image.width) {
+            val value = f64FromInt(x) * c + f64FromInt(y) * s
+            ramp[y * image.width + x] = value
+            if (value < low) low = value
+            if (value > high) high = value
+        }
+    }
+    val out = grayFilled(image.width, image.height, 0.0)
+    for (i in 0 until ramp.size) out.pixels[i] = clamp255(image.pixels[i] * (1.0 - depth + depth * (ramp[i] - low) / (high - low)))
+    out
+}
+
+fun sensorNoise(image: Gray, var rng: Rng, sigma: f64): Gray {
+    val out = grayFilled(image.width, image.height, 0.0)
+    for (i in 0 until image.pixels.size) out.pixels[i] = clamp255(image.pixels[i] + rng.normal(0.0, sigma))
+    out
+}
+
+// JPEG's loss without its entropy coding: 8x8 DCT, the standard luminance quantization at a quality, and back.
+fun jpegLike(image: Gray, quality: int): Gray {
+    val base: array<int> = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+        18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
+    val scale = if (quality < 50) 5000 / quality else 200 - 2 * quality
+    val quant = filledArray(64, 1.0)
+    for (i in 0 until 64) {
+        var q = (base[i] * scale + 50) / 100
+        if (q < 1) q = 1
+        if (q > 255) q = 255
+        quant[i] = f64FromInt(q)
+    }
+    val cosines = filledArray(64, 0.0)
+    for (u in 0 until 8) for (x in 0 until 8) cosines[u * 8 + x] = cos((2.0 * f64FromInt(x) + 1.0) * f64FromInt(u) * 3.141592653589793 / 16.0)
+    val out = grayFilled(image.width, image.height, 0.0)
+    val block = filledArray(64, 0.0)
+    val coefficients = filledArray(64, 0.0)
+    for (by in 0 until (image.height + 7) / 8) {
+        for (bx in 0 until (image.width + 7) / 8) {
+            for (y in 0 until 8) {
+                for (x in 0 until 8) {
+                    var sx = bx * 8 + x
+                    var sy = by * 8 + y
+                    if (sx >= image.width) sx = image.width - 1
+                    if (sy >= image.height) sy = image.height - 1
+                    block[y * 8 + x] = image.pixels[sy * image.width + sx] - 128.0
+                }
+            }
+            for (v in 0 until 8) {
+                for (u in 0 until 8) {
+                    var sum = 0.0
+                    for (y in 0 until 8) for (x in 0 until 8) sum = sum + block[y * 8 + x] * cosines[u * 8 + x] * cosines[v * 8 + y]
+                    val cu = if (u == 0) 0.7071067811865476 else 1.0
+                    val cv = if (v == 0) 0.7071067811865476 else 1.0
+                    val coefficient = 0.25 * cu * cv * sum
+                    coefficients[v * 8 + u] = floor(coefficient / quant[v * 8 + u] + 0.5) * quant[v * 8 + u]
+                }
+            }
+            for (y in 0 until 8) {
+                for (x in 0 until 8) {
+                    var sum = 0.0
+                    for (v in 0 until 8) {
+                        for (u in 0 until 8) {
+                            val cu = if (u == 0) 0.7071067811865476 else 1.0
+                            val cv = if (v == 0) 0.7071067811865476 else 1.0
+                            sum = sum + cu * cv * coefficients[v * 8 + u] * cosines[u * 8 + x] * cosines[v * 8 + y]
+                        }
+                    }
+                    val px = bx * 8 + x
+                    val py = by * 8 + y
+                    if (px < image.width && py < image.height) out.pixels[py * image.width + px] = clamp255(0.25 * sum + 128.0)
+                }
+            }
+        }
+    }
+    out
+}
+
+// The last stages every simulated shot goes through.
+fun camera(image: Gray, var rng: Rng, blur: f64 = 1.0, noise: f64 = 5.0, quality: int = 70): Gray =
+    jpegLike(sensorNoise(gaussianBlur(image, blur), rng, noise), quality)
+
+fun inBox(code: Gray, border: int, box: int, value: f64): bool = value >= f64FromInt(border * box) && value <= f64FromInt(code.width - border * box)
+
+fun fillEllipse(var image: Gray, cx: f64, cy: f64, radius: f64, value: f64): void {
+    val x0 = f64ToInt(floor(cx - radius))
+    val x1 = f64ToInt(ceil(cx + radius))
+    val y0 = f64ToInt(floor(cy - radius))
+    val y1 = f64ToInt(ceil(cy + radius))
+    for (y in y0 until y1 + 1) {
+        for (x in x0 until x1 + 1) {
+            if (x >= 0 && y >= 0 && x < image.width && y < image.height) {
+                val dx = f64FromInt(x) - cx
+                val dy = f64FromInt(y) - cy
+                if (dx * dx + dy * dy <= radius * radius) image.pixels[y * image.width + x] = value
+            }
+        }
+    }
+    return
+}
+
+fun blotches(code: Gray, var rng: Rng, count: int, radius: f64): Gray {
+    val out = copyOf(code)
+    val low = 24.0
+    val high = f64FromInt(code.width) - 24.0
+    val finder = 9.0 * 6.0 + low
+    var placed = 0
+    while (placed < count) {
+        val x = rng.uniform(low, high)
+        val y = rng.uniform(low, high)
+        // Keep off the finder patterns: without all three the code can't be located.
+        if (!((x < finder && y < finder) || (x > high - 54.0 && y < finder) || (x < finder && y > high - 54.0))) {
+            fillEllipse(out, x, y, radius, if (rng.next(2) == 0) 0.0 else 255.0)
+            placed = placed + 1
+        }
+    }
+    out
+}
+
+fun centreLogo(code: Gray, fraction: f64): Gray {
+    val out = copyOf(code)
+    val side = f64FromInt(code.width) * fraction
+    val middle = f64FromInt(code.width) / 2.0
+    for (y in 0 until code.height) {
+        for (x in 0 until code.width) {
+            val dx = fabs(f64FromInt(x) - middle)
+            val dy = fabs(f64FromInt(y) - middle)
+            if (dx <= side / 2.0 && dy <= side / 2.0) {
+                out.pixels[y * code.width + x] = if (dx > side / 2.0 - 4.0 || dy > side / 2.0 - 4.0) 0.0 else 255.0
+            }
+        }
+    }
+    out
+}
+
+fun scratches(code: Gray, var rng: Rng, count: int): Gray {
+    val out = copyOf(code)
+    val low = 24.0
+    val high = f64FromInt(code.width) - 24.0
+    for (i in 0 until count) {
+        val x0 = rng.uniform(low, high)
+        val y0 = rng.uniform(low, high)
+        val x1 = rng.uniform(low, high)
+        val y1 = rng.uniform(low, high)
+        val value = if (rng.next(2) == 0) 0.0 else 255.0
+        val steps = f64ToInt(sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0))) + 1
+        for (s in 0 until steps + 1) {
+            val t = f64FromInt(s) / f64FromInt(steps)
+            fillEllipse(out, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, 1.5, value)
+        }
+    }
+    out
+}
+
+fun invert(image: Gray): Gray {
+    val out = grayFilled(image.width, image.height, 0.0)
+    for (i in 0 until image.pixels.size) out.pixels[i] = 255.0 - image.pixels[i]
+    out
+}
+
+fun mirror(image: Gray): Gray {
+    val out = grayFilled(image.width, image.height, 0.0)
+    for (y in 0 until image.height) for (x in 0 until image.width) out.pixels[y * image.width + x] = image.pixels[y * image.width + image.width - 1 - x]
+    out
+}
+
+fun appendU32(var out: ByteBuffer, value: int): void {
+    out.appendByteValue((value >>> 24) & 255)
+    out.appendByteValue((value >>> 16) & 255)
+    out.appendByteValue((value >>> 8) & 255)
+    out.appendByteValue(value & 255)
+    return
+}
+
+fun appendChunk(var out: ByteBuffer, kind: string, data: string): void {
+    appendU32(out, data.size)
+    out.appendText(kind)
+    out.appendText(data)
+    appendU32(out, qrPngCrc32(kind + data))
+    return
+}
+
+// An 8-bit greyscale PNG.
+fun grayPng(image: Gray): string {
+    val raw = byteBuffer()
+    for (y in 0 until image.height) {
+        raw.appendByteValue(0)
+        for (x in 0 until image.width) raw.appendByteValue(f64ToInt(floor(clamp255(image.pixels[y * image.width + x]) + 0.5)))
+    }
+    val data = raw.toText()
+    val gzip = gzipCompress(data)
+    val zlib = byteBuffer()
+    zlib.appendByteValue(0x78)
+    zlib.appendByteValue(0x01)
+    zlib.appendText(gzip.slice(10, gzip.size - 8))
+    appendU32(zlib, qrPngAdler32(data))
+    val out = byteBuffer()
+    out.appendText(qrPngSignature())
+    val header = byteBuffer()
+    appendU32(header, image.width)
+    appendU32(header, image.height)
+    for (b in [8, 0, 0, 0, 0]) header.appendByteValue(b)
+    appendChunk(out, "IHDR", header.toText())
+    appendChunk(out, "IDAT", zlib.toText())
+    appendChunk(out, "IEND", "")
+    out.toText()
+}
+
+class Emitter(val directory: string, val lines: array<string>) {
+    fun add(name: string, category: string, text: string, image: Gray): void {
+        Path("${this.directory}/$name.png").writeText(grayPng(image))
+        this.lines.append("$name.png\t$category\t${hexEncode(text)}")
+        return
+    }
+}
+
+fun smallSet(var rng: Rng, var out: Emitter): void {
+    val t = TEXTS()
+    out.add("rotated-30", "rotated", t[0], rotate(codeImage(t[0], "M", 6), 30.0, true, 255.0))
+    out.add("rotated-135-noise", "rotated", t[1], camera(rotate(pasteOnBackground(rng, codeImage(t[1], "M", 6), 520), 135.0, false, 235.0), rng))
+    out.add("perspective-strong", "perspective", t[2], camera(perspective(pasteOnBackground(rng, codeImage(t[2], "Q", 6), 620), 0.13, rng), rng))
+    out.add("sheared", "skewed", t[3], camera(shear(pasteOnBackground(rng, codeImage(t[3], "M", 6), 560), 0.32, 0.12), rng))
+    out.add("uneven-light", "lighting", t[4], camera(unevenLight(pasteOnBackground(rng, codeImage(t[4], "M", 6), 700), rng, 0.8), rng))
+    out.add("damaged-blotches", "damaged", t[0], camera(blotches(codeImage(t[0], "H", 6), rng, 5, 11.0), rng))
+    out.add("damaged-logo", "damaged", t[0], centreLogo(codeImage(t[0], "H", 8), 0.2))
+    out.add("curved-can", "curved", t[6], cylinder(pasteOnBackground(rng, codeImage(t[6], "M", 7), 760), 0.75))
+    out.add("large-version", "perspective", t[8], camera(perspective(pasteOnBackground(rng, codeImage(t[8], "L", 4), 1000), 0.04, rng), rng, 0.6, 3.0, 85))
+    out.add("inverted", "inverted", t[0], invert(codeImage(t[0], "M", 6)))
+    out.add("mirrored", "mirrored", t[0], mirror(codeImage(t[0], "M", 6)))
+    out.add("tiny-rotated", "small", t[0], jpegLike(rotate(codeImage(t[0], "M", 3), 17.0, true, 255.0), 80))
+    return
+}
+
+fun stressSet(var rng: Rng, var out: Emitter): void {
+    val t = TEXTS()
+    val shifts: array<f64> = [0.14, 0.17, 0.2, 0.23, 0.14, 0.17, 0.2, 0.23, 0.14, 0.17, 0.2, 0.23]
+    for (index in 0 until 12) {
+        val text = t[index % 7]
+        val code = pasteOnBackground(rng, codeImage(text, "M", 6), 900)
+        out.add("stress-perspective-$index", "stress-perspective", text, camera(perspective(code, shifts[index], rng), rng))
+    }
+    val angles: array<f64> = [11.0, 37.0, 62.0, 148.0, 201.0, 299.0]
+    for (index in 0 until 6) {
+        val text = t[index % 7]
+        val code = pasteOnBackground(rng, codeImage(text, "M", 2), 500)
+        out.add("stress-small-$index", "stress-small", text, camera(rotate(code, angles[index], false, 235.0), rng, 0.6, 4.0, 75))
+    }
+    val strengths: array<f64> = [1.1, 1.25, 1.4]
+    for (index in 0 until 3) {
+        val text = t[index + 4]
+        val code = pasteOnBackground(rng, codeImage(text, "M", 8), 900)
+        out.add("stress-curved-$index", "stress-curved", text, camera(cylinder(code, strengths[index]), rng, 0.8, 4.0, 75))
+    }
+    val sigmas: array<f64> = [3.5, 4.5, 5.5]
+    for (index in 0 until 3) out.add("stress-blur-$index", "stress-blur", t[0], gaussianBlur(codeImage(t[0], "M", 8), sigmas[index]))
+    val counts: array<int> = [8, 10, 12, 14]
+    for (index in 0 until 4) out.add("stress-scratch-$index", "stress-damage", t[1], camera(scratches(codeImage(t[1], "Q", 6), rng, counts[index]), rng))
+    return
+}
+
+fun fullSet(var rng: Rng, var out: Emitter): void {
+    val t = TEXTS()
+    stressSet(rng, out)
+    smallSet(rng, out)
+    for (step in 0 until 24) {
+        val angle = step * 15
+        val text = t[step % 7]
+        val code = pasteOnBackground(rng, codeImage(text, if (angle % 2 == 1) "Q" else "M", 6), 900)
+        out.add("rotate-$angle", "rotated", text, camera(rotate(code, f64FromInt(angle), false, 235.0), rng))
+    }
+    for (index in 0 until 16) {
+        val text = t[index % 7]
+        val code = pasteOnBackground(rng, codeImage(text, "M", 6), 900)
+        out.add("perspective-$index", "perspective", text, camera(perspective(code, 0.05 + 0.1 * f64FromInt(index % 4) / 3.0, rng), rng))
+    }
+    val shears: array<f64> = [0.2, 0.0, 0.0, 0.2, 0.35, 0.0, 0.0, 0.35, 0.3, 0.2, -0.3, 0.15, 0.25, -0.25, -0.4, 0.0]
+    for (index in 0 until 8) {
+        val text = t[index % 7]
+        out.add("skew-$index", "skewed", text, camera(shear(pasteOnBackground(rng, codeImage(text, "M", 6), 900), shears[2 * index], shears[2 * index + 1]), rng))
+    }
+    for (index in 0 until 10) {
+        val text = t[index % 7]
+        val code = pasteOnBackground(rng, codeImage(text, "M", 6), 800)
+        out.add("light-$index", "lighting", text, camera(unevenLight(code, rng, 0.5 + 0.04 * f64FromInt(index)), rng))
+    }
+    val blurs: array<f64> = [1.0, 1.5, 2.0, 2.5, 3.0]
+    for (index in 0 until 5) out.add("blur-$index", "blur", t[index % 5], jpegLike(gaussianBlur(codeImage(t[index % 5], "M", 8), blurs[index]), 80))
+    val noises: array<f64> = [10.0, 20.0, 30.0, 40.0]
+    for (index in 0 until 4) out.add("noise-$index", "noise", t[0], sensorNoise(codeImage(t[0], "M", 8), rng, noises[index]))
+    for (index in 0 until 16) out.add("blotch-$index", "damaged", t[0], camera(blotches(codeImage(t[0], "H", 6), rng, 3 + index / 2, f64FromInt(8 + index % 4)), rng))
+    for (index in 0 until 8) out.add("scratch-$index", "damaged", t[1], camera(scratches(codeImage(t[1], "Q", 6), rng, 2 + index), rng))
+    val fractions: array<f64> = [0.15, 0.2, 0.25]
+    for (index in 0 until 3) out.add("logo-$index", "damaged", t[0], centreLogo(codeImage(t[0], "H", 8), fractions[index]))
+    val strengths: array<f64> = [0.4, 0.6, 0.8, 1.0]
+    for (index in 0 until 4) {
+        val text = t[6 - index]
+        out.add("cylinder-$index", "curved", text, cylinder(pasteOnBackground(rng, codeImage(text, "M", 8), 900), strengths[index]))
+    }
+    for (box in [2, 3, 4]) {
+        out.add("tiny-$box", "small", t[0], codeImage(t[0], "M", box))
+        out.add("tiny-rot-$box", "small", t[0], rotate(codeImage(t[0], "M", box), 23.0, true, 255.0))
+    }
+    val plain = codeImage(t[0], "M", 6)
+    val flat = grayFilled(plain.width, plain.height, 0.0)
+    for (i in 0 until plain.pixels.size) flat.pixels[i] = 110.0 + floor(plain.pixels[i] / 8.0)
+    out.add("contrast-low", "lighting", t[0], flat)
+    for (version in [5, 10, 15, 20, 25, 30, 35, 40]) {
+        val maker = Rng(version)
+        val alphabet = "abcdefghij 0123456789"
+        var text = ""
+        for (i in 0 until version * version / 2 + 20) {
+            val at = maker.next(alphabet.size)
+            text = text + alphabet.slice(at, at + 1)
+        }
+        val code = codeImage(text, "L", 4, 4, version)
+        out.add("high-version-$version", "large", text, camera(perspective(pasteOnBackground(rng, code, code.width + 120), 0.015, rng), rng, 0.5, 2.0, 90))
+    }
+    return
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    Path(directory).createDirectories()
+    val lines: array<string> = []
+    val rng = Rng(20261031)
+    fullSet(rng, Emitter(directory, lines))
+    Path("$directory/manifest.tsv").writeText(lines.join("\n") + "\n")
+    println("${lines.size} fixtures in $directory")
+    0
+}

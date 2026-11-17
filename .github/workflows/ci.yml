@@ -18,5 +18,5 @@ jobs:
           version: '0.2.50'
       - name: Run unit tests and examples
         run: make test-in-shell COMPILER=ablac
-      - name: Run interoperability tests against zbar, ZXing, segno, python-qrcode and qrencode
+      - name: Run interoperability tests against zbar
         run: make interop COMPILER=ablac

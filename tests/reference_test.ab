@@ -1,0 +1,54 @@
+// The encoder against two other encoders, bit for bit: tests/reference/matrices.tsv.z holds the module matrices that segno
+// (alphanumeric payloads) and python-qrcode (byte payloads) made for the same payloads, for every version and level and
+// every mask on nine versions: 412 matrices. See tests/reference/README.md for how the file was made.
+import "abla/test"
+import "abla/text"
+import "abla/crypto"
+import "abla/fs"
+import "abla/bytes"
+import "../src/png.ab"
+import "../src/qr.ab"
+import "../src/encode.ab"
+import "../src/matrix.ab"
+
+fun ecOf(name: string): QrErrorCorrection =
+    if (name == "L") qrEcLow else if (name == "Q") qrEcQuartile else if (name == "H") qrEcHigh else qrEcMedium
+
+fun parse(text: string): int {
+    var value = 0
+    for (byte in text) value = value * 10 + byte - 48
+    value
+}
+
+fun main: int {
+    val inflated = qrZlibInflate(Path("tests/reference/matrices.tsv.z").readText(), 64 * 1024 * 1024)
+    if (inflated == null) {
+        expect(false, "the reference file unpacks")
+        return testsPassed()
+    }
+    val unpacked = byteBuffer()
+    for (byte in inflated) unpacked.appendByteValue(int(byte))
+    var compared = 0
+    for (line in unpacked.toText().split("\n")) {
+        if (line.size > 0) {
+            val fields = line.split("\t")
+            val version = parse(fields[0])
+            val level = fields[1]
+            val mode = fields[2]
+            val mask = parse(fields[3])
+            val data = hexDecode(fields[4])
+            val options = QrOptions(errorCorrection = ecOf(level), minVersion = version, maxVersion = version, mask = mask)
+            val result = if (mode == "byte") qrEncodeBytes(data, options) else qrEncode(data, options)
+            val matrix = result.matrix
+            if (matrix == null) {
+                expect(false, "v$version-$level mask $mask $mode: ${result.error}")
+            } else {
+                val ours = qrMatrixText(matrix).trim().split("\n").join("/")
+                expect(ours == fields[5], "v$version-$level mask $mask $mode matrix differs from the reference encoder's")
+            }
+            compared = compared + 1
+        }
+    }
+    expectEqual(compared, 412, "matrices compared")
+    testsPassed()
+}
