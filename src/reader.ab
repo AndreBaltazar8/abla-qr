@@ -7,7 +7,6 @@
 
 import "abla/float"
 import "abla/math"
-import "abla/text"
 import "tables.ab"
 import "matrix.ab"
 import "image.ab"
