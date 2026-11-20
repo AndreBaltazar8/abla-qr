@@ -19,7 +19,6 @@ import "abla/process"
 import "abla/text"
 import "../src/qr.ab"
 import "../src/encode.ab"
-import "../src/matrix.ab"
 import "../src/png.ab"
 
 class Rng(var state: int) {

@@ -1,6 +1,5 @@
 import "abla/test"
 import "abla/float"
-import "abla/bytes"
 import "abla/math"
 import "support.ab"
 import "../src/qr.ab"
