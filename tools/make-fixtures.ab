@@ -357,8 +357,6 @@ fun jpegLike(image: Gray, quality: int): Gray {
 fun camera(image: Gray, var rng: Rng, blur: f64 = 1.0, noise: f64 = 5.0, quality: int = 70): Gray =
     jpegLike(sensorNoise(gaussianBlur(image, blur), rng, noise), quality)
 
-fun inBox(code: Gray, border: int, box: int, value: f64): bool = value >= f64FromInt(border * box) && value <= f64FromInt(code.width - border * box)
-
 fun fillEllipse(var image: Gray, cx: f64, cy: f64, radius: f64, value: f64): void {
     val x0 = f64ToInt(floor(cx - radius))
     val x1 = f64ToInt(ceil(cx + radius))

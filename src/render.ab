@@ -77,12 +77,6 @@ private fun appendChunk(var out: ByteBuffer, kind: string, data: string): void {
     return
 }
 
-private fun u32Text(value: int): string {
-    val out = byteBuffer()
-    appendU32(out, value)
-    out.toText()
-}
-
 private fun rgbText(color: int): string {
     val out = byteBuffer()
     out.appendByteValue((color >>> 16) & 255)
